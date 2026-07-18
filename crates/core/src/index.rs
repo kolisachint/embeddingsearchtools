@@ -41,6 +41,16 @@ impl Metric {
     }
 }
 
+impl std::fmt::Display for Metric {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Metric::Cosine => "cosine",
+            Metric::Dot => "dot",
+            Metric::Euclidean => "euclidean",
+        })
+    }
+}
+
 impl std::str::FromStr for Metric {
     type Err = Error;
     fn from_str(s: &str) -> Result<Self> {
@@ -101,6 +111,11 @@ pub trait Index {
 ///
 /// Deletes are tombstoned (marked dead, not removed) so ids and rows stay stable
 /// for cheap updates; [`FlatIndex::compact`] reclaims the dead rows.
+///
+/// Under [`Metric::Cosine`] and [`Metric::Dot`], queries exclude rows scoring
+/// `<= 0.0` (orthogonal or opposed vectors), so a query may return fewer than
+/// `k` hits rather than padding with noise. [`Metric::Euclidean`] scores are
+/// negated distances and are never filtered.
 #[derive(Debug, Clone)]
 pub struct FlatIndex {
     dim: usize,
@@ -279,12 +294,20 @@ impl Index for FlatIndex {
             crate::embed::l2_normalize(&mut q);
         }
 
+        // For similarity metrics a score <= 0 means "orthogonal or opposed" —
+        // returning such rows just pads top-k with noise, so drop them. Not
+        // applied to Euclidean, whose scores are legitimately negative.
+        let similarity = matches!(self.metric, Metric::Cosine | Metric::Dot);
+
         // Bounded top-k via a small ascending-by-score vector. For the target
         // scale a partial-sort beats a full sort of all rows.
         let mut top: Vec<SearchResult> = Vec::with_capacity(k + 1);
         for (r, id) in self.ids.iter().enumerate() {
             let Some(id) = id else { continue };
             let score = self.metric.score(&q, self.row(r));
+            if similarity && score <= 0.0 {
+                continue;
+            }
             if top.len() < k {
                 top.push(SearchResult {
                     id: id.clone(),
