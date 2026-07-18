@@ -136,12 +136,29 @@ db.save("./store")?;
 ## Bundling the model
 
 The `onnx` build compiles the weights straight into the binary from
-`crates/core/models/`. The committed placeholders are empty; drop in the real
-files and rebuild. See [`crates/core/models/README.md`](crates/core/models/README.md)
-for the exact files and where to get them. (This repo's build environment blocks
-Hugging Face, so the weights are supplied out-of-band rather than fetched here.)
+`crates/core/models/`. The committed placeholders are empty; fetch the real
+weights and rebuild:
+
+```bash
+scripts/fetch-model.sh                 # downloads MiniLM int8 ONNX + tokenizer
+cargo build --release --features onnx  # self-contained MiniLM binary
+```
+
+See [`crates/core/models/README.md`](crates/core/models/README.md) for details.
+
+## Finishing setup end-to-end
+
+The CI/release workflows and crates.io publishing need a login with GitHub's
+`workflow` scope and Hugging Face access. The complete, self-contained runbook —
+bundling the model, installing the workflows (from [`docs/workflows/`](docs/workflows/)),
+publishing crates, and cutting a release — is in **[`docs/SETUP.md`](docs/SETUP.md)**.
 
 ## Development
+
+```bash
+cargo test                 # full suite against the mock backend
+cargo build --release      # default binary
+```
 
 ```bash
 cargo test                 # full suite against the mock backend

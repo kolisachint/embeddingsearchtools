@@ -1,0 +1,94 @@
+name: Release
+
+# Cut a release by pushing a semver tag, e.g.:
+#   git tag v0.1.0 && git push origin v0.1.0
+on:
+  push:
+    tags: ["v*.*.*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Build a SELF-CONTAINED MiniLM binary per platform (real int8 weights fetched
+  # and bundled via `--features onnx`) and attach it to the GitHub Release.
+  # GitHub Releases have no 10 MB size cap, so bundling the ~23 MB model is fine
+  # here (unlike the crates.io publish job below).
+  binaries:
+    name: binary (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            ext: ""
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            ext: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            ext: ".exe"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Fetch the real MiniLM int8 weights into crates/core/models/ so the
+      # `onnx` build bundles them. Runners have Hugging Face access.
+      - name: Fetch model weights
+        shell: bash
+        run: bash scripts/fetch-model.sh
+
+      - name: Build (bundled MiniLM)
+        run: cargo build --release --features onnx --target ${{ matrix.target }} -p embsearch-cli
+
+      - name: Package
+        shell: bash
+        run: |
+          bin="target/${{ matrix.target }}/release/embsearch${{ matrix.ext }}"
+          name="embsearch-${{ github.ref_name }}-${{ matrix.target }}"
+          mkdir -p dist
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            7z a "dist/${name}.zip" "./${bin}" ./README.md
+          else
+            tar -czf "dist/${name}.tar.gz" -C "target/${{ matrix.target }}/release" embsearch -C "$GITHUB_WORKSPACE" README.md
+          fi
+
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Publish the crates to crates.io. This job does NOT fetch weights: the model
+  # placeholders stay empty so the packaged crate stays tiny (crates.io caps
+  # packages at 10 MB, well under the ~23 MB model). Consumers who enable the
+  # `onnx` feature supply weights via `--model <dir>` or a local bundle.
+  # Core must publish before the CLI, which depends on it.
+  publish-crates:
+    name: publish to crates.io
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish embsearch-core
+        run: cargo publish -p embsearch-core --token "$CARGO_REGISTRY_TOKEN"
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+
+      - name: Wait for core to appear in the index
+        run: sleep 30
+
+      - name: Publish embsearch-cli
+        run: cargo publish -p embsearch-cli --token "$CARGO_REGISTRY_TOKEN"
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
