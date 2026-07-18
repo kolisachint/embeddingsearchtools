@@ -6,6 +6,13 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+# The real MiniLM weights (fetched by scripts/fetch-model.sh) must never be
+# packaged for crates.io: they are ~23 MB and blow past the 10 MB package cap.
+# `cargo` ignores git's skip-worktree, so exclude them explicitly here. build.rs
+# synthesizes empty placeholders when absent so the `onnx` feature still
+# compiles from a published crate (see build.rs).
+exclude = ["models/model.onnx", "models/tokenizer.json"]
+
 [lib]
 name = "embsearch_core"
 path = "src/lib.rs"

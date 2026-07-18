@@ -45,12 +45,17 @@ printf '%s\n' \
 ./target/release/embsearch query --path ./store "fast animal" -k 2
 ```
 
-> **Do not commit the real weights.** They're ~23 MB and would bloat git and blow
-> past the crates.io 10 MB package cap. Keep the empty placeholders tracked:
+> **Do not commit the real weights.** They're ~23 MB and would bloat git. Keep the
+> empty placeholders tracked:
 > ```bash
 > git update-index --skip-worktree crates/core/models/model.onnx crates/core/models/tokenizer.json
 > ```
 > (Undo later with `--no-skip-worktree` if you ever need to.)
+>
+> The crates.io 10 MB cap is enforced separately by the `exclude` in
+> `crates/core/Cargo.toml` — `cargo package`/`publish` drops these files even
+> when they're present locally, so you can publish from a weights-populated
+> checkout safely.
 
 ## 2. Install the CI + release workflows
 
@@ -82,8 +87,14 @@ cargo publish -p embsearch-core --dry-run
 ```
 
 Notes:
-- The publish job intentionally does **not** fetch weights, so the packaged crate
-  stays tiny (empty placeholders). Consumers who enable `onnx` supply weights via
+- The packaged crate stays tiny regardless of your working tree: the real
+  weights are listed under `exclude` in `crates/core/Cargo.toml`, so `cargo
+  package`/`publish` never ships them even if you've run `fetch-model.sh`
+  locally. (`cargo` ignores git's `skip-worktree`, so `exclude` — not the empty
+  git placeholders — is what enforces the size bound.) A crate built from
+  crates.io with `--features onnx` still compiles: `build.rs` synthesizes empty
+  placeholders for the excluded files and prints a `cargo:warning` pointing at
+  `scripts/fetch-model.sh`. Consumers who enable `onnx` supply weights via
   `embsearch --model <dir>` or by dropping files into `crates/core/models/` and
   building locally.
 - If you ever want the weights bundled *inside* the published crate, you'd need to
