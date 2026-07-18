@@ -13,6 +13,14 @@ compiles before the real weights are available. With placeholders in place,
 `MiniLmEmbedder::from_bundled()` fails at ONNX session-build time with a clear
 runtime error — it does **not** break compilation.
 
+These two files are also listed under `exclude` in `../Cargo.toml`, so they are
+never shipped in the crates.io package (which keeps it under the 10 MB cap) even
+if you've fetched the real ~23 MB weights locally. Because an excluded file is
+absent from a crate built off crates.io, `../build.rs` recreates an empty
+placeholder when either file is missing and prints a `cargo:warning` — so the
+`onnx` feature still compiles everywhere, just non-functionally until real
+weights are supplied.
+
 ## Supplying the real weights
 
 Drop the two real files in this directory (same names) and rebuild:
