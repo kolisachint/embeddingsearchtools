@@ -1,11 +1,11 @@
-# End-to-end setup runbook
+# Setup & release runbook
 
-This is the complete, self-contained checklist to finish the project from a
-machine with full access (Hugging Face + a GitHub login that has the `workflow`
-scope). Nothing here depends on the original build environment — everything you
-need is committed in this repo.
+Status of this project: **the build + release pipeline is live and has shipped.**
+This document is now a reference for *how it works* and *how to cut future
+releases*, not a list of pending blockers. The historical "couldn't push from the
+original environment" caveats have been resolved — see the changelog below.
 
-## What's already done (on the branch)
+## Current state (done)
 
 - Rust workspace: `embsearch-core` (library) + `embsearch-cli` (`embsearch` binary).
 - Embedder / Index / Store abstractions, `Database` API, CLI, NDJSON daemon,
@@ -13,22 +13,53 @@ need is committed in this repo.
 - Default build uses a deterministic `MockEmbedder`; real MiniLM is behind the
   `onnx` feature.
 - `fmt` + `clippy -D warnings` clean; full test suite passes.
-- Crates are publish-ready (verified with `cargo publish --dry-run`).
+- **CI + release workflows are installed and tracked** in `.github/workflows/`
+  (`ci.yml`, `release.yml`).
+- **Releases have shipped**: tags `v0.1.1` and `v0.1.2` are pushed to origin;
+  the crates.io publish + GitHub Release + cross-platform onnx binaries run
+  automatically from the release workflow.
 
-## What this runbook completes
-
-1. Bundle the **real MiniLM int8 weights** and build/test the `onnx` backend.
-2. Install the **CI + release workflows** (couldn't be pushed from the original
-   environment — that login lacked GitHub's `workflow` scope).
-3. Publish to **crates.io** and cut a **release** with self-contained binaries.
+> `docs/workflows/` retains the original standalone copies of the workflow files
+> for historical reference. The authoritative, running versions are the ones in
+> `.github/workflows/`; they have since diverged (the live release workflow is
+> PR-label-driven — see below).
 
 ---
 
-## 1. Bundle the real model and build the onnx backend
+## Cutting a release (the live flow)
+
+Releases are **automated and driven by PR labels** — you do *not* tag by hand.
+
+1. Open a PR with your changes.
+2. Add one of these labels before merging:
+   - `cargo:patch` → x.y.**z+1**
+   - `cargo:minor` → x.**y+1**.0
+   - `cargo:major` → **x+1**.0.0
+3. Merge the PR into `main`.
+
+On merge, `release.yml` automatically:
+
+1. **Bumps** the workspace version in `Cargo.toml` (single source of truth;
+   member crates inherit via `version.workspace = true`) and every intra-workspace
+   pinned dependency, then commits `release: vX.Y.Z` and pushes an annotated tag.
+2. **Publishes** `embsearch-core` then `embsearch-cli` to crates.io
+   (`CRATES_IO_TOKEN` secret). Already-published versions are skipped, not failed.
+3. **Creates a GitHub Release** for the tag with generated notes.
+4. **Builds self-contained MiniLM binaries** (`--features onnx`, real ~23 MB
+   int8 weights fetched via `scripts/fetch-model.sh`) for linux/macOS
+   (x86_64 + arm64)/Windows and uploads them with per-asset SHA256.
+5. **Aggregates** a `SHA256SUMS` file onto the release.
+
+Merging without a `cargo:*` label makes no release — the workflow is a no-op.
+
+---
+
+## Working with the onnx backend locally
 
 The `onnx` build bundles `crates/core/models/{model.onnx,tokenizer.json}` into
-the binary via `include_bytes!`. Those files are committed as **empty
-placeholders**; replace them with the real weights:
+the binary via `include_bytes!`. In git these are **empty placeholders** so the
+feature compiles before weights are present; supply real weights locally to run
+real embeddings:
 
 ```bash
 # Downloads all-MiniLM-L6-v2 int8 ONNX + tokenizer into crates/core/models/
@@ -45,78 +76,45 @@ printf '%s\n' \
 ./target/release/embsearch query --path ./store "fast animal" -k 2
 ```
 
-> **Do not commit the real weights.** They're ~23 MB and would bloat git. Keep the
+> **Don't commit the real weights.** They're ~23 MB and would bloat git. Keep the
 > empty placeholders tracked:
 > ```bash
 > git update-index --skip-worktree crates/core/models/model.onnx crates/core/models/tokenizer.json
 > ```
-> (Undo later with `--no-skip-worktree` if you ever need to.)
->
-> The crates.io 10 MB cap is enforced separately by the `exclude` in
-> `crates/core/Cargo.toml` — `cargo package`/`publish` drops these files even
-> when they're present locally, so you can publish from a weights-populated
-> checkout safely.
+> (Undo with `--no-skip-worktree`.) The crates.io 10 MB cap is enforced by the
+> `exclude` in `crates/core/Cargo.toml`, so `cargo package`/`publish` drops these
+> files even when the real weights are present locally — you can publish from a
+> weights-populated checkout safely.
 
-## 2. Install the CI + release workflows
-
-The workflow files live in [`docs/workflows/`](workflows/) because the original
-environment's git token was refused write access to `.github/workflows/`. Copy
-them into place from a login that has the `workflow` scope:
+Swap the model dir at runtime without rebuilding — `--model` is a per-command
+flag (holds `model.onnx` + `tokenizer.json`):
 
 ```bash
-mkdir -p .github/workflows
-cp docs/workflows/ci.yml docs/workflows/release.yml .github/workflows/
-git add .github/workflows/
-git commit -m "Add CI and release workflows"
-git push
+embsearch query --path ./store --model <dir> "your query"
 ```
 
-- **`ci.yml`** — on every push/PR: `fmt`, `clippy -D warnings`, `test`, plus
-  default-backend release-binary builds for linux/macOS/Windows as artifacts.
-- **`release.yml`** — on a `v*.*.*` tag: builds **self-contained MiniLM binaries**
-  (fetches weights, `--features onnx`) into a GitHub Release, and publishes both
-  crates to crates.io.
+---
 
-## 3. crates.io
+## crates.io notes
 
-The `CRATES_IO_TOKEN` repository secret is already set and is what
-`release.yml` reads. Before the first real publish, sanity-check locally:
+- `release.yml` publishes automatically; to sanity-check locally first:
+  ```bash
+  cargo publish -p embsearch-core --dry-run
+  ```
+- The packaged crate stays tiny regardless of working tree: real weights are under
+  `exclude` in `crates/core/Cargo.toml`, so they never ship even after
+  `fetch-model.sh`. A crate built from crates.io with `--features onnx` still
+  compiles — `build.rs` synthesizes empty placeholders for the excluded files and
+  prints a `cargo:warning` pointing at `scripts/fetch-model.sh`. Consumers who
+  enable `onnx` supply weights via `embsearch <cmd> --model <dir>` or by dropping
+  files into `crates/core/models/` and building locally.
+- To bundle weights *inside* the published crate you'd need a crates.io
+  package-size-limit increase (default 10 MB).
 
-```bash
-cargo publish -p embsearch-core --dry-run
-```
-
-Notes:
-- The packaged crate stays tiny regardless of your working tree: the real
-  weights are listed under `exclude` in `crates/core/Cargo.toml`, so `cargo
-  package`/`publish` never ships them even if you've run `fetch-model.sh`
-  locally. (`cargo` ignores git's `skip-worktree`, so `exclude` — not the empty
-  git placeholders — is what enforces the size bound.) A crate built from
-  crates.io with `--features onnx` still compiles: `build.rs` synthesizes empty
-  placeholders for the excluded files and prints a `cargo:warning` pointing at
-  `scripts/fetch-model.sh`. Consumers who enable `onnx` supply weights via
-  `embsearch --model <dir>` or by dropping files into `crates/core/models/` and
-  building locally.
-- If you ever want the weights bundled *inside* the published crate, you'd need to
-  request a crates.io package-size-limit increase (default is 10 MB).
-- Crate names `embsearch-core` / `embsearch-cli` must be available on crates.io.
-  If taken, rename in the `[package]` names and the CLI's dependency, then retry.
-
-## 4. Cut a release
-
-```bash
-git tag v0.1.0
-git push origin v0.1.0
-```
-
-That fires `release.yml`: cross-platform self-contained binaries attach to the
-GitHub Release for tag `v0.1.0`, and `embsearch-core` then `embsearch-cli`
-publish to crates.io.
-
-## 5. (Optional) also run onnx checks in CI
+## (Optional) onnx checks in CI
 
 `ci.yml` builds the default (mock) backend for speed. To also exercise the real
-backend in CI, add a job that runs `scripts/fetch-model.sh` then
+backend, add a job that runs `scripts/fetch-model.sh` then
 `cargo build --features onnx` / `cargo test --features onnx`. Left out by default
 so CI stays fast and doesn't depend on Hugging Face for every push.
 
@@ -128,5 +126,3 @@ so CI stays fast and doesn't depend on Hugging Face for every push.
   (~23 MB model + ~10–15 MB ONNX Runtime + binary).
 - Model: `all-MiniLM-L6-v2`, int8 ONNX from `Xenova/all-MiniLM-L6-v2` on
   Hugging Face (see `scripts/fetch-model.sh` for exact URLs).
-- Swap the model dir at runtime without rebuilding: `embsearch --model <dir> ...`
-  (dir holds `model.onnx` + `tokenizer.json`).
