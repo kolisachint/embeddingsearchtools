@@ -1,0 +1,27 @@
+[package]
+name = "embsearch-core"
+description = "Embedding generation + vector search core: embedder abstraction, flat index, persistence."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "embsearch_core"
+path = "src/lib.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+# Enabled only with the `onnx` feature (real MiniLM inference).
+ort = { workspace = true, optional = true }
+tokenizers = { workspace = true, optional = true }
+ndarray = { workspace = true, optional = true }
+
+[features]
+default = []
+# Real MiniLM embeddings via ONNX Runtime. Requires the ONNX Runtime native
+# library and the bundled model weights (see crates/core/models/).
+onnx = ["dep:ort", "dep:tokenizers", "dep:ndarray"]

@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: fmt · clippy · test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy (default backend)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests (default backend)
+        run: cargo test --workspace
+
+  release-binary:
+    name: release binary (${{ matrix.target }})
+    needs: test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Default (mock) backend: the onnx build needs the real MiniLM weights,
+      # which are supplied out-of-band. Once weights are bundled, add
+      # `--features onnx` here.
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }} -p embsearch-cli
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: embsearch-${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/release/embsearch
+            target/${{ matrix.target }}/release/embsearch.exe
+          if-no-files-found: error

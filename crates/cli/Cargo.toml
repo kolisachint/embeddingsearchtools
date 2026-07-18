@@ -1,0 +1,24 @@
+[package]
+name = "embsearch-cli"
+description = "CLI + stdio daemon for embsearch: index, query, update, and serve embeddings."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "embsearch"
+path = "src/main.rs"
+
+[dependencies]
+# `version` is required (alongside `path`) so `cargo publish` can resolve the
+# dependency from crates.io rather than the local path.
+embsearch-core = { path = "../core", version = "0.1.0" }
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+
+[features]
+default = []
+# Forward the ONNX/MiniLM backend to the core crate.
+onnx = ["embsearch-core/onnx"]

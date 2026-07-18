@@ -1,0 +1,10 @@
+/target
+Cargo.lock
+embsearch-store/
+*.tmp
+
+# NOTE: crates/core/models/{model.onnx,tokenizer.json} are committed as EMPTY
+# placeholders so the `onnx` feature compiles. When you drop in the real
+# multi-megabyte weights locally, do NOT commit them — e.g.
+#   git update-index --skip-worktree crates/core/models/model.onnx
+# to keep the large file out of git.
