@@ -35,10 +35,9 @@ The canonical source is Hugging Face — the int8 ONNX export from
 - `onnx/model_quantized.onnx`  → save here as `model.onnx`
 - `tokenizer.json`
 
-> This repository's build environment blocks outbound access to
-> `huggingface.co`, so the weights cannot be fetched during the build here. Fetch
-> them in an environment that permits Hugging Face (or download once and copy the
-> files in), then rebuild with `--features onnx`.
+The easiest path is `scripts/fetch-model.sh`, which downloads both files into
+this directory. The release workflow runs it before building the self-contained
+`onnx` binaries, and CI-free local builds can run it too.
 
 ## Using an external model dir instead of bundling
 
