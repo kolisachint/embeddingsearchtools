@@ -91,13 +91,21 @@ Requests:
 {"op":"update","id":"x","text":"..."}
 {"op":"upsert","id":"x","text":"..."}
 {"op":"remove","id":"x"}
+{"op":"bulk","items":[{"id":"a","text":"..."},{"id":"b","text":"..."}]}
 {"op":"save"}
+{"op":"compact"}
 {"op":"count"}
+{"op":"info"}
 {"op":"ping"}
 ```
 
 Responses always carry `ok`: `{"ok":true,"results":[{"id","score"}]}` or
-`{"ok":false,"error":"..."}`.
+`{"ok":false,"error":"..."}`. `bulk` embeds the whole batch in one inference
+(the fast path for bulk indexing) and answers
+`{"ok":true,"inserted_count":N,"updated_count":M}`; `info` answers
+`{"ok":true,"model_id":"...","dim":384,"count":N}` so clients can verify the
+backend (e.g. reject the non-semantic mock build) before indexing; `compact`
+reclaims rows tombstoned by `remove`.
 
 ## TypeScript usage
 

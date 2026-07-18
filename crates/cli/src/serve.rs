@@ -14,8 +14,12 @@
 //! - `{"op":"update","id":"x","text":"..."}`     → replace
 //! - `{"op":"upsert","id":"x","text":"..."}`     → insert-or-replace
 //! - `{"op":"remove","id":"x"}`                  → delete
+//! - `{"op":"bulk","items":[{"id","text"},..]}`  → batched upsert (one
+//!   batched embedding inference; the fast path for bulk indexing)
 //! - `{"op":"save"}`                             → persist to the store dir
+//! - `{"op":"compact"}`                          → reclaim tombstoned rows
 //! - `{"op":"count"}`                            → live vector count
+//! - `{"op":"info"}`                             → model id, dim, count
 //! - `{"op":"ping"}`                             → readiness probe
 //!
 //! Responses always carry `ok`:
@@ -53,9 +57,20 @@ enum Request {
     Remove {
         id: String,
     },
+    Bulk {
+        items: Vec<BulkItem>,
+    },
     Save,
+    Compact,
     Count,
+    Info,
     Ping,
+}
+
+#[derive(Debug, Deserialize)]
+struct BulkItem {
+    id: String,
+    text: String,
 }
 
 fn default_k() -> usize {
@@ -80,6 +95,14 @@ struct OkResponse {
     removed: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inserted_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    updated_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dim: Option<usize>,
 }
 
 impl OkResponse {
@@ -90,6 +113,10 @@ impl OkResponse {
             inserted: None,
             removed: None,
             count: None,
+            inserted_count: None,
+            updated_count: None,
+            model_id: None,
+            dim: None,
         }
     }
 }
@@ -189,6 +216,29 @@ fn handle<E: Embedder>(
             }
             Err(e) => Response::error(e),
         },
+        Request::Bulk { items } => {
+            let pairs = items.into_iter().map(|i| (i.id, i.text));
+            match db.upsert_batch(pairs) {
+                Ok((inserted, updated)) => {
+                    let mut r = OkResponse::empty();
+                    r.inserted_count = Some(inserted);
+                    r.updated_count = Some(updated);
+                    Response::Ok(r)
+                }
+                Err(e) => Response::error(e),
+            }
+        }
+        Request::Compact => {
+            db.compact();
+            Response::Ok(OkResponse::empty())
+        }
+        Request::Info => {
+            let mut r = OkResponse::empty();
+            r.model_id = Some(db.embedder().model_id().to_string());
+            r.dim = Some(db.embedder().dim());
+            r.count = Some(db.len());
+            Response::Ok(r)
+        }
         Request::Save => match store_dir {
             Some(dir) => match db.save(dir) {
                 Ok(()) => Response::Ok(OkResponse::empty()),
@@ -227,6 +277,57 @@ mod tests {
         assert_eq!(out[0]["ok"], true);
         assert_eq!(out[2]["results"][0]["id"], "a");
         assert_eq!(out[3]["count"], 2);
+    }
+
+    #[test]
+    fn bulk_upserts_and_reports_counts() {
+        let out = drive(&[
+            r#"{"op":"add","id":"a","text":"old text"}"#,
+            r#"{"op":"bulk","items":[{"id":"a","text":"quick brown fox"},{"id":"b","text":"lazy dog"}]}"#,
+            r#"{"op":"count"}"#,
+            r#"{"op":"query","text":"quick fox","k":1}"#,
+        ]);
+        assert_eq!(out[1]["ok"], true);
+        assert_eq!(out[1]["inserted_count"], 1); // b was new
+        assert_eq!(out[1]["updated_count"], 1); // a was replaced
+        assert_eq!(out[2]["count"], 2);
+        assert_eq!(out[3]["results"][0]["id"], "a");
+    }
+
+    #[test]
+    fn bulk_empty_items_is_ok() {
+        let out = drive(&[r#"{"op":"bulk","items":[]}"#]);
+        assert_eq!(out[0]["ok"], true);
+        assert_eq!(out[0]["inserted_count"], 0);
+        assert_eq!(out[0]["updated_count"], 0);
+    }
+
+    #[test]
+    fn info_reports_model_and_dim() {
+        let out = drive(&[
+            r#"{"op":"add","id":"a","text":"hello"}"#,
+            r#"{"op":"info"}"#,
+        ]);
+        assert_eq!(out[1]["ok"], true);
+        assert_eq!(out[1]["model_id"], "mock-hash-v1");
+        assert_eq!(out[1]["dim"], 32);
+        assert_eq!(out[1]["count"], 1);
+    }
+
+    #[test]
+    fn compact_after_remove_keeps_results() {
+        let out = drive(&[
+            r#"{"op":"add","id":"a","text":"quick brown fox"}"#,
+            r#"{"op":"add","id":"b","text":"lazy dog"}"#,
+            r#"{"op":"remove","id":"b"}"#,
+            r#"{"op":"compact"}"#,
+            r#"{"op":"query","text":"quick fox","k":2}"#,
+            r#"{"op":"count"}"#,
+        ]);
+        assert_eq!(out[3]["ok"], true);
+        assert_eq!(out[4]["results"][0]["id"], "a");
+        assert_eq!(out[4]["results"].as_array().unwrap().len(), 1);
+        assert_eq!(out[5]["count"], 1);
     }
 
     #[test]
