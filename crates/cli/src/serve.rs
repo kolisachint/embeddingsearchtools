@@ -232,10 +232,10 @@ mod tests {
     #[test]
     fn errors_are_reported_not_fatal() {
         let out = drive(&[
-            r#"{"op":"query"}"#,               // missing text/vector
-            r#"{"op":"remove","id":"nope"}"#,  // absent id -> removed:false
-            r#"not json at all"#,              // parse error
-            r#"{"op":"ping"}"#,                // loop still alive
+            r#"{"op":"query"}"#,              // missing text/vector
+            r#"{"op":"remove","id":"nope"}"#, // absent id -> removed:false
+            r#"not json at all"#,             // parse error
+            r#"{"op":"ping"}"#,               // loop still alive
         ]);
         assert_eq!(out[0]["ok"], false);
         assert_eq!(out[1]["removed"], false);

@@ -181,8 +181,7 @@ mod minilm {
                 .map_err(Error::embed)?
                 .commit_from_memory(model)
                 .map_err(Error::embed)?;
-            let tokenizer =
-                Tokenizer::from_bytes(tokenizer_json).map_err(Error::embed)?;
+            let tokenizer = Tokenizer::from_bytes(tokenizer_json).map_err(Error::embed)?;
             Ok(Self {
                 session: Mutex::new(session),
                 tokenizer,
@@ -237,20 +236,18 @@ mod minilm {
                 "token_type_ids" => Value::from_array(types).map_err(Error::embed)?,
             ];
 
-            let mut session = self.session.lock().map_err(|_| {
-                Error::embed("embedding session mutex poisoned")
-            })?;
+            let mut session = self
+                .session
+                .lock()
+                .map_err(|_| Error::embed("embedding session mutex poisoned"))?;
             let outputs = session.run(inputs).map_err(Error::embed)?;
             let (shape, data) = outputs[0]
                 .try_extract_tensor::<f32>()
                 .map_err(Error::embed)?;
             // Expect [batch, seq, hidden].
             let hidden = *shape.last().unwrap() as usize;
-            let token_embeds = Array2::from_shape_vec(
-                (batch * seq, hidden),
-                data.to_vec(),
-            )
-            .map_err(Error::embed)?;
+            let token_embeds = Array2::from_shape_vec((batch * seq, hidden), data.to_vec())
+                .map_err(Error::embed)?;
 
             // Mean-pool over tokens using the attention mask, then normalize.
             let mut out = Vec::with_capacity(batch);

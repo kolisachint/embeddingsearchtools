@@ -209,13 +209,19 @@ mod tests {
         let before = db.query("apple banana cherry", 1).unwrap()[0].score;
         db.update("a", "zebra yak walrus").unwrap();
         let after = db.query("apple banana cherry", 1).unwrap()[0].score;
-        assert!(after < before, "updating to unrelated text should lower score");
+        assert!(
+            after < before,
+            "updating to unrelated text should lower score"
+        );
     }
 
     #[test]
     fn update_unknown_errors() {
         let mut db = db();
-        assert!(matches!(db.update("missing", "x"), Err(Error::UnknownId(_))));
+        assert!(matches!(
+            db.update("missing", "x"),
+            Err(Error::UnknownId(_))
+        ));
     }
 
     #[test]
@@ -242,7 +248,13 @@ mod tests {
     fn dimension_mismatch_on_vector() {
         let mut db = db();
         let err = db.add_vector("a", vec![0.0; 5]).unwrap_err();
-        assert!(matches!(err, Error::DimensionMismatch { expected: 128, got: 5 }));
+        assert!(matches!(
+            err,
+            Error::DimensionMismatch {
+                expected: 128,
+                got: 5
+            }
+        ));
     }
 
     #[test]
@@ -258,7 +270,8 @@ mod tests {
     fn compact_preserves_results() {
         let mut db = db();
         for i in 0..20 {
-            db.add(&format!("id{i}"), &format!("token{i} shared word")).unwrap();
+            db.add(&format!("id{i}"), &format!("token{i} shared word"))
+                .unwrap();
         }
         for i in 0..10 {
             db.remove(&format!("id{i}")).unwrap();

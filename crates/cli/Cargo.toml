@@ -11,7 +11,9 @@ name = "embsearch"
 path = "src/main.rs"
 
 [dependencies]
-embsearch-core = { path = "../core" }
+# `version` is required (alongside `path`) so `cargo publish` can resolve the
+# dependency from crates.io rather than the local path.
+embsearch-core = { path = "../core", version = "0.1.0" }
 serde.workspace = true
 serde_json.workspace = true
 clap.workspace = true

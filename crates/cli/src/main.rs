@@ -192,18 +192,21 @@ fn cmd_index(store: StoreArgs, input: String) -> embsearch_core::Result<()> {
         if line.trim().is_empty() {
             continue;
         }
-        let rec: Record = serde_json::from_str(&line).map_err(|e| {
-            embsearch_core::Error::Config(format!("line {}: {e}", lineno + 1))
-        })?;
+        let rec: Record = serde_json::from_str(&line)
+            .map_err(|e| embsearch_core::Error::Config(format!("line {}: {e}", lineno + 1)))?;
         // Upsert so re-indexing an existing store updates in place.
         db.upsert(&rec.id, &rec.text)?;
         n += 1;
-        if n % 1000 == 0 {
+        if n.is_multiple_of(1000) {
             let _ = writeln!(stderr.lock(), "  indexed {n}...");
         }
     }
     db.save(&store.path)?;
-    println!("indexed {n} records -> {} vectors at {}", db.len(), store.path.display());
+    println!(
+        "indexed {n} records -> {} vectors at {}",
+        db.len(),
+        store.path.display()
+    );
     Ok(())
 }
 
