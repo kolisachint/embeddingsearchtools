@@ -81,7 +81,8 @@ jobs:
       - name: Commit and tag
         run: |
           VERSION="${{ steps.bump.outputs.version }}"
-          git add Cargo.toml Cargo.lock crates/*/Cargo.toml
+          # Cargo.lock is gitignored in this repo, so it is intentionally not staged.
+          git add Cargo.toml crates/*/Cargo.toml
           git commit -m "release: v${VERSION}"
           git tag -a "v${VERSION}" -m "release: v${VERSION}"
 
