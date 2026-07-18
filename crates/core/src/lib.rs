@@ -136,6 +136,29 @@ impl<E: Embedder> Database<E> {
         Ok(())
     }
 
+    /// Embed each `(id, text)` and insert-or-replace them. Uses the embedder's
+    /// batch path, so this is the fast route for bulk (re)indexing. Returns
+    /// `(inserted, updated)` counts.
+    pub fn upsert_batch<I, S>(&mut self, items: I) -> Result<(usize, usize)>
+    where
+        I: IntoIterator<Item = (S, S)>,
+        S: Into<String>,
+    {
+        let (ids, texts): (Vec<String>, Vec<String>) =
+            items.into_iter().map(|(i, t)| (i.into(), t.into())).unzip();
+        let vectors = self.embedder.embed_batch(&texts)?;
+        let mut inserted = 0usize;
+        let mut updated = 0usize;
+        for (id, v) in ids.into_iter().zip(vectors) {
+            if self.index.upsert(&id, v)? {
+                inserted += 1;
+            } else {
+                updated += 1;
+            }
+        }
+        Ok((inserted, updated))
+    }
+
     /// Top-`k` matches for the embedding of `query`, best first.
     pub fn query(&self, query: &str, k: usize) -> Result<Vec<SearchResult>> {
         let v = self.embedder.embed(query)?;

@@ -24,6 +24,17 @@ export interface SearchResult {
   score: number;
 }
 
+export interface DaemonInfo {
+  modelId: string;
+  dim: number;
+  count: number;
+}
+
+export interface BulkResult {
+  inserted: number;
+  updated: number;
+}
+
 export interface EmbSearchOptions {
   /** Path to the `embsearch` binary. */
   binaryPath: string;
@@ -56,19 +67,12 @@ export class EmbSearchClient {
       stdio: ["pipe", "pipe", "pipe"],
     });
 
-    // The daemon prints a readiness banner to stderr once loaded.
-    this.readyPromise = new Promise((resolve) => {
-      const onData = (chunk: Buffer) => {
-        if (chunk.toString().includes("daemon ready")) {
-          this.proc.stderr.off("data", onData);
-          resolve();
-        }
-      };
-      this.proc.stderr.on("data", onData);
-    });
-
     this.proc.stdout.setEncoding("utf8");
     this.proc.stdout.on("data", (chunk: string) => this.onStdout(chunk));
+
+    // Readiness = the daemon answering a ping. This probes the actual
+    // request loop instead of grepping stderr for a banner string.
+    this.readyPromise = this.send({ op: "ping" }).then(() => undefined);
 
     this.proc.on("exit", (code) => {
       this.closed = true;
@@ -116,6 +120,34 @@ export class EmbSearchClient {
   async query(text: string, k = 10): Promise<SearchResult[]> {
     const res = await this.send({ op: "query", text, k });
     return res.results ?? [];
+  }
+
+  /**
+   * Batched insert-or-replace. One embedding inference for the whole batch —
+   * the fast path for bulk indexing. Keep batches modest (e.g. 32–64) so a
+   * concurrent query is not stuck behind a huge inference.
+   */
+  async bulk(items: Array<{ id: string; text: string }>): Promise<BulkResult> {
+    const res = await this.send({ op: "bulk", items });
+    return {
+      inserted: res.inserted_count ?? 0,
+      updated: res.updated_count ?? 0,
+    };
+  }
+
+  /** Model id, dimensionality, and live vector count of the daemon. */
+  async info(): Promise<DaemonInfo> {
+    const res = await this.send({ op: "info" });
+    return {
+      modelId: res.model_id ?? "",
+      dim: res.dim ?? 0,
+      count: res.count ?? 0,
+    };
+  }
+
+  /** Reclaim tombstoned rows left behind by `remove`. */
+  async compact(): Promise<void> {
+    await this.send({ op: "compact" });
   }
 
   /** Search using a precomputed query vector. */
