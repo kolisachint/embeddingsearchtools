@@ -35,6 +35,12 @@ pub enum Error {
     /// A configuration value was invalid.
     #[error("invalid config: {0}")]
     Config(String),
+
+    /// A line of caller-supplied input (e.g. a JSONL record) could not be
+    /// parsed. `line` is the 1-based line number in the input stream; `msg` is
+    /// the underlying parser message.
+    #[error("invalid input at line {line}: {msg}")]
+    InvalidInput { line: usize, msg: String },
 }
 
 impl Error {

@@ -33,6 +33,15 @@ The backend is chosen at build time; nothing else in the code changes.
 Configurable per store: `cosine` (default, vectors stored normalized), `dot`, or
 `euclidean` (returned as negated distance so higher always means more similar).
 
+The metric is fixed when a store is created; opening an existing store with a
+conflicting `--metric` prints a warning to stderr and keeps the stored metric.
+
+Under `cosine` and `dot`, hits scoring `<= 0` (orthogonal or opposed vectors)
+are excluded from results instead of padding top-k with noise, so a query may
+return fewer than `k` hits. This mirrors the filtering the TS client already
+does client-side, as defense for other callers. `euclidean` scores are negated
+distances — legitimately negative — and are never filtered.
+
 ### Efficient updates
 
 `FlatIndex` supports `add` / `update` / `upsert` / `remove` without rebuilding.
@@ -99,6 +108,7 @@ Requests:
 {"op":"ping"}
 ```
 
+`query` takes `text` **or** `vector`, not both — sending both is an error.
 Responses always carry `ok`: `{"ok":true,"results":[{"id","score"}]}` or
 `{"ok":false,"error":"..."}`. `bulk` embeds the whole batch in one inference
 (the fast path for bulk indexing) and answers

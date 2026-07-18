@@ -66,13 +66,16 @@ pub fn save(dir: impl AsRef<Path>, index: &FlatIndex, model_id: &str) -> Result<
 }
 
 /// Load an index from `dir`. Returns the index and the model id recorded when it
-/// was saved (callers should verify it matches their embedder).
+/// was saved. [`crate::Database::open`] verifies that id against its embedder;
+/// callers loading a store directly (e.g. tooling without an embedder) should do
+/// the same check themselves before mixing vectors from different models.
 pub fn load(dir: impl AsRef<Path>) -> Result<(FlatIndex, String)> {
     let dir = dir.as_ref();
 
     let manifest: Manifest = {
         let f = std::fs::File::open(dir.join(MANIFEST))?;
-        serde_json::from_reader(BufReader::new(f))?
+        serde_json::from_reader(BufReader::new(f))
+            .map_err(|e| Error::corrupt(format!("invalid {MANIFEST}: {e}")))?
     };
     if manifest.format_version != FORMAT_VERSION {
         return Err(Error::corrupt(format!(
@@ -83,7 +86,8 @@ pub fn load(dir: impl AsRef<Path>) -> Result<(FlatIndex, String)> {
 
     let ids: Vec<Option<String>> = {
         let f = std::fs::File::open(dir.join(IDS))?;
-        serde_json::from_reader(BufReader::new(f))?
+        serde_json::from_reader(BufReader::new(f))
+            .map_err(|e| Error::corrupt(format!("invalid {IDS}: {e}")))?
     };
     if ids.len() != manifest.rows {
         return Err(Error::corrupt(format!(

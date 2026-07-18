@@ -10,6 +10,7 @@
 //! Requests (`op` selects the operation):
 //! - `{"op":"query","text":"...","k":5}`        → search
 //! - `{"op":"query","vector":[...],"k":5}`       → search a precomputed vector
+//!   (`text` and `vector` are mutually exclusive; sending both is an error)
 //! - `{"op":"add","id":"x","text":"..."}`        → insert
 //! - `{"op":"update","id":"x","text":"..."}`     → replace
 //! - `{"op":"upsert","id":"x","text":"..."}`     → insert-or-replace
@@ -177,7 +178,10 @@ fn handle<E: Embedder>(
         }
         Request::Query { text, vector, k } => {
             let result = match (text, vector) {
-                (Some(t), _) => db.query(&t, k),
+                (Some(_), Some(_)) => {
+                    return Response::error("query accepts text or vector, not both");
+                }
+                (Some(t), None) => db.query(&t, k),
                 (None, Some(v)) => db.query_vector(&v, k),
                 (None, None) => {
                     return Response::error("query requires `text` or `vector`");
@@ -342,5 +346,42 @@ mod tests {
         assert_eq!(out[1]["removed"], false);
         assert_eq!(out[2]["ok"], false);
         assert_eq!(out[3]["ok"], true);
+    }
+
+    #[test]
+    fn query_with_both_text_and_vector_is_an_error() {
+        let out = drive(&[
+            r#"{"op":"add","id":"a","text":"quick brown fox"}"#,
+            r#"{"op":"query","text":"quick fox","vector":[0.1],"k":1}"#,
+            r#"{"op":"ping"}"#, // loop still alive
+        ]);
+        assert_eq!(out[1]["ok"], false);
+        assert_eq!(out[1]["error"], "query accepts text or vector, not both");
+        assert_eq!(out[2]["ok"], true);
+    }
+
+    #[test]
+    fn empty_id_and_empty_text_are_rejected() {
+        let out = drive(&[
+            r#"{"op":"add","id":"","text":"some text"}"#,
+            r#"{"op":"add","id":"a","text":""}"#,
+            r#"{"op":"upsert","id":"","text":"some text"}"#,
+            r#"{"op":"bulk","items":[{"id":"ok","text":"fine"},{"id":"","text":"bad"}]}"#,
+            r#"{"op":"count"}"#,
+        ]);
+        assert_eq!(out[0]["ok"], false);
+        assert!(out[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("id must not be empty"));
+        assert_eq!(out[1]["ok"], false);
+        assert!(out[1]["error"]
+            .as_str()
+            .unwrap()
+            .contains("text must not be empty"));
+        assert_eq!(out[2]["ok"], false);
+        assert_eq!(out[3]["ok"], false);
+        // Validation failed the whole batch before anything was applied.
+        assert_eq!(out[4]["count"], 0);
     }
 }

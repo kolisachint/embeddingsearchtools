@@ -13,7 +13,7 @@
 mod serve;
 
 use clap::{Parser, Subcommand};
-use embsearch_core::{Database, Embedder, Metric};
+use embsearch_core::{Database, Embedder, Index, Metric};
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -87,9 +87,11 @@ struct StoreArgs {
     /// Store directory. Created on first write.
     #[arg(short, long, default_value = "./embsearch-store")]
     path: PathBuf,
-    /// Similarity metric (used only when creating a new store): cosine|dot|euclidean.
-    #[arg(short, long, default_value = "cosine")]
-    metric: String,
+    /// Similarity metric: cosine|dot|euclidean. Used when creating a new store
+    /// (default: cosine); an existing store keeps its stored metric, and a
+    /// conflicting flag only produces a warning.
+    #[arg(short, long)]
+    metric: Option<String>,
     /// Override the model directory (with `--features onnx`): a dir holding
     /// `model.onnx` + `tokenizer.json`. Ignored by the default mock build.
     #[arg(long)]
@@ -192,8 +194,11 @@ fn cmd_index(store: StoreArgs, input: String) -> embsearch_core::Result<()> {
         if line.trim().is_empty() {
             continue;
         }
-        let rec: Record = serde_json::from_str(&line)
-            .map_err(|e| embsearch_core::Error::Config(format!("line {}: {e}", lineno + 1)))?;
+        let rec: Record =
+            serde_json::from_str(&line).map_err(|e| embsearch_core::Error::InvalidInput {
+                line: lineno + 1,
+                msg: e.to_string(),
+            })?;
         // Upsert so re-indexing an existing store updates in place.
         db.upsert(&rec.id, &rec.text)?;
         n += 1;
@@ -211,10 +216,25 @@ fn cmd_index(store: StoreArgs, input: String) -> embsearch_core::Result<()> {
 }
 
 /// Open (or create) the store, wiring in the compile-time-selected embedder.
+///
+/// `--metric` only takes effect when a new store is created. When it conflicts
+/// with an existing store's manifest, the stored metric stays authoritative and
+/// a warning is printed to stderr.
 fn open_db(store: &StoreArgs) -> embsearch_core::Result<Database<Box<dyn Embedder>>> {
-    let metric: Metric = store.metric.parse()?;
+    let requested: Option<Metric> = store.metric.as_deref().map(str::parse).transpose()?;
     let embedder = build_embedder(store)?;
-    Database::open_or_create(embedder, &store.path, metric)
+    let db = Database::open_or_create(embedder, &store.path, requested.unwrap_or(Metric::Cosine))?;
+    if let Some(requested) = requested {
+        let stored = db.index().metric();
+        if stored != requested {
+            eprintln!(
+                "warning: --metric {requested} ignored: existing store at {} uses metric \
+                 '{stored}' (the stored metric is authoritative; re-index to change it)",
+                store.path.display()
+            );
+        }
+    }
+    Ok(db)
 }
 
 #[cfg(not(feature = "onnx"))]
