@@ -114,24 +114,42 @@ vectors) uses multi-accumulator loops that LLVM auto-vectorizes — no `unsafe`,
 `std::simd`, no external crate. Measured **~3x** throughput over the naive
 single-accumulator reduction at `dim=384`.
 
-**Flat vs HNSW.** On 40k clustered vectors (`dim=384`, cosine), the exact scan
-runs ~9 ms/query while HNSW answers in well under 1 ms. HNSW query cost is
-`O(log n)` so its edge widens with scale; `ef_search` trades recall for latency
-and is tunable at runtime (`HnswIndex::set_ef_search`):
+**Flat vs HNSW.** `FlatIndex` is exact — recall is always 100%. `HnswIndex` is
+approximate: it answers in `O(log n)` instead of scanning every vector, so its
+speed edge widens with scale, and `ef_search` trades recall for latency. The
+default `ef_search=200` **favors accuracy** (`HnswIndex::set_ef_search` tunes it
+at runtime). On 10k clustered vectors (`dim=384`, cosine), against the exact scan:
 
-| `ef_search` | recall@10 | speedup vs exact (40k) |
-|------------:|----------:|-----------------------:|
-| 32          | ~36%      | ~34x                   |
-| 128 (default) | ~62%    | ~12x                   |
-| 256         | ~81%      | ~7x                    |
+| `ef_search` | recall@10 | speedup vs exact |
+|------------:|----------:|-----------------:|
+| 16          | ~46%      | ~13x             |
+| 64          | ~74%      | ~8x              |
+| 128         | ~87%      | ~4x              |
+| **200 (default)** | **~94%** | **~2.5x**  |
+| 256         | ~98%      | ~2x              |
 
-(Recall rises toward exact as `ef_search` grows; at 10k the same settings reach
-~80% / ~96% recall since a fixed `ef` covers more of a smaller graph.)
+Recall falls as the dataset grows at a *fixed* `ef` (a constant candidate list
+covers a smaller fraction of a larger graph): the default reaches ~94% at 10k and
+~82% at 40k, so raise `ef_search` for larger corpora. Because HNSW gets
+disproportionately faster at scale (~50x at 40k, low `ef`), you can afford a much
+larger `ef` there and still beat the exact scan.
 
 The tradeoff is **build time**: the flat index just appends vectors, while HNSW
-builds a graph (~10³ vectors/s here, distance-bound). That cost is paid once —
-the `serve` daemon builds the graph at startup and keeps it hot, and searches run
+builds a graph (~10³ vectors/s here, distance-bound; the accuracy-first
+`ef_construction=200` is part of that cost). It is paid once — the `serve` daemon
+builds the graph at startup and keeps it hot, and searches then run
 allocation-free — so HNSW is for the long-lived daemon, not one-shot CLI calls.
+
+### Accuracy summary
+
+| Backend | Recall | When |
+|---------|--------|------|
+| `flat` | **exact (100%)** | correctness matters, or up to a few 100k vectors |
+| `hnsw` | **~94% default, tunable to ~98%+** | large corpora where query latency dominates |
+| `--hybrid` | improves *relevance* (not recall vs vectors) | queries with exact terms embeddings blur |
+
+The default is `flat` — exact — so you opt into approximation deliberately. When
+you do, the harness above measures the actual recall for your data and settings.
 
 ## CLI
 

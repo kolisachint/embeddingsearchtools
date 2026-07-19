@@ -38,12 +38,14 @@ const M: usize = 16;
 /// Max neighbors per node on layer 0 (denser, as is conventional: `2 * M`).
 const M0: usize = 32;
 /// Candidate-list size while building the graph. Larger = better graph, slower
-/// inserts.
-const EF_CONSTRUCTION: usize = 128;
+/// inserts. Set high because build is a one-time, offline cost and graph
+/// quality is the ceiling on achievable recall.
+const EF_CONSTRUCTION: usize = 200;
 /// Candidate-list size while querying. Larger = better recall, slower queries.
 /// The effective value is `max(EF_SEARCH, k)`. Queries are far cheaper than the
-/// exact scan, so this is set generously to keep recall high.
-const EF_SEARCH: usize = 128;
+/// exact scan, so the default favors accuracy; lower it via
+/// [`HnswIndex::set_ef_search`] to trade recall for latency.
+const EF_SEARCH: usize = 200;
 /// Hard cap on layer count, so a pathological RNG draw can't allocate absurdly.
 const MAX_LEVEL: usize = 16;
 /// Fixed RNG seed: builds are reproducible from the vectors alone.
@@ -195,7 +197,9 @@ impl HnswIndex {
     /// Set the query-time candidate-list size (`ef`). Higher values raise recall
     /// toward exact search at the cost of query latency; the effective value is
     /// always at least `k`. This only affects [`query`](Index::query) and can be
-    /// changed at any time. The default is 128.
+    /// changed at any time. The default (200) favors recall; larger datasets may
+    /// want it higher still, since a fixed `ef` covers a smaller fraction of the
+    /// graph as the index grows.
     pub fn set_ef_search(&mut self, ef: usize) {
         self.ef_search = ef.max(1);
     }
@@ -645,14 +649,15 @@ mod tests {
     #[test]
     fn recall_is_high_euclidean() {
         // Euclidean never filters, so top-k is always full — a clean recall test.
+        // The default ef_search favors accuracy, so we hold a high bar here.
         let r = recall(Metric::Euclidean, 800, 32, 60, 10);
-        assert!(r >= 0.90, "euclidean recall too low: {r}");
+        assert!(r >= 0.95, "euclidean recall too low: {r}");
     }
 
     #[test]
     fn recall_is_high_cosine() {
         let r = recall(Metric::Cosine, 800, 32, 60, 10);
-        assert!(r >= 0.90, "cosine recall too low: {r}");
+        assert!(r >= 0.95, "cosine recall too low: {r}");
     }
 
     #[test]

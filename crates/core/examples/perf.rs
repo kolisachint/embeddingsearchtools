@@ -201,18 +201,21 @@ fn bench_index(n: usize) {
         "  {:<10} {:>9} {:>9} {:>9} {:>10}",
         "ef_search", "recall", "p50(ms)", "p95(ms)", "speedup"
     );
-    for &ef in &[16usize, 32, 64, 128, 256] {
+    let default_ef = HnswIndex::new(DIM, Metric::Cosine).ef_search();
+    for &ef in &[16usize, 32, 64, 128, 200, 256] {
         hnsw.set_ef_search(ef);
         let (lat, hits) = query_latencies(&hnsw, &queries, k);
         let recall = mean_recall(&hits, &truth);
         let s = sorted(&lat);
+        let marker = if ef == default_ef { " (default)" } else { "" };
         println!(
-            "  {:<10} {:>8.1}% {:>9.3} {:>9.3} {:>9.1}x",
+            "  {:<10} {:>8.1}% {:>9.3} {:>9.3} {:>9.1}x{}",
             ef,
             recall * 100.0,
             percentile(&s, 50.0),
             percentile(&s, 95.0),
             flat_mean / mean(&lat),
+            marker,
         );
     }
 }
