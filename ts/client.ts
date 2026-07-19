@@ -28,6 +28,8 @@ export interface DaemonInfo {
   modelId: string;
   dim: number;
   count: number;
+  /** Index backend the store uses: `"flat"` (exact) or `"hnsw"` (approximate). */
+  index: string;
 }
 
 export interface BulkResult {
@@ -135,13 +137,14 @@ export class EmbSearchClient {
     };
   }
 
-  /** Model id, dimensionality, and live vector count of the daemon. */
+  /** Model id, dimensionality, live vector count, and index backend. */
   async info(): Promise<DaemonInfo> {
     const res = await this.send({ op: "info" });
     return {
       modelId: res.model_id ?? "",
       dim: res.dim ?? 0,
       count: res.count ?? 0,
+      index: res.index ?? "flat",
     };
   }
 

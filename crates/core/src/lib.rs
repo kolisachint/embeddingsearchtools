@@ -23,35 +23,47 @@
 
 mod embed;
 mod error;
+mod hnsw;
 mod index;
 pub mod store;
 
 pub use embed::{l2_normalize, Embedder, MockEmbedder};
 pub use error::{Error, Result};
-pub use index::{FlatIndex, Index, Metric, SearchResult};
+pub use hnsw::HnswIndex;
+pub use index::{AnyIndex, FlatIndex, Index, IndexKind, Metric, SearchResult};
 
 #[cfg(feature = "onnx")]
 pub use embed::MiniLmEmbedder;
 
 use std::path::Path;
 
-/// The primary API: an [`Embedder`] paired with a [`FlatIndex`].
+/// The primary API: an [`Embedder`] paired with a vector [`AnyIndex`].
 ///
 /// Text goes in, vectors are produced and indexed, and queries are answered by
 /// embedding the query text and searching. Vectors can also be supplied directly
 /// via the `*_vector` methods when embeddings are computed elsewhere.
+///
+/// The index backend ([`IndexKind::Flat`] for exact search, [`IndexKind::Hnsw`]
+/// for approximate) is chosen when the store is first created and preserved
+/// across reopens.
 pub struct Database<E: Embedder> {
     embedder: E,
-    index: FlatIndex,
+    index: AnyIndex,
 }
 
 impl<E: Embedder> Database<E> {
-    /// Create an empty database using `embedder` and `metric`.
+    /// Create an empty database using `embedder` and `metric`, backed by the
+    /// exact [`FlatIndex`].
     pub fn new(embedder: E, metric: Metric) -> Self {
+        Self::new_with_index(embedder, metric, IndexKind::Flat)
+    }
+
+    /// Create an empty database with an explicit index backend.
+    pub fn new_with_index(embedder: E, metric: Metric, kind: IndexKind) -> Self {
         let dim = embedder.dim();
         Self {
             embedder,
-            index: FlatIndex::new(dim, metric),
+            index: AnyIndex::new(kind, dim, metric),
         }
     }
 
@@ -80,12 +92,26 @@ impl<E: Embedder> Database<E> {
         Ok(Self { embedder, index })
     }
 
-    /// Open the store at `dir` if it exists, otherwise create an empty one.
+    /// Open the store at `dir` if it exists, otherwise create an empty exact
+    /// ([`IndexKind::Flat`]) one.
     pub fn open_or_create(embedder: E, dir: impl AsRef<Path>, metric: Metric) -> Result<Self> {
+        Self::open_or_create_with(embedder, dir, metric, IndexKind::Flat)
+    }
+
+    /// Open the store at `dir` if it exists, otherwise create an empty one with
+    /// the given index backend. `kind` (like `metric`) only takes effect when a
+    /// new store is created; an existing store keeps the backend it was built
+    /// with.
+    pub fn open_or_create_with(
+        embedder: E,
+        dir: impl AsRef<Path>,
+        metric: Metric,
+        kind: IndexKind,
+    ) -> Result<Self> {
         if store::exists(&dir) {
             Self::open(embedder, dir)
         } else {
-            Ok(Self::new(embedder, metric))
+            Ok(Self::new_with_index(embedder, metric, kind))
         }
     }
 
@@ -204,8 +230,13 @@ impl<E: Embedder> Database<E> {
     }
 
     /// Borrow the underlying index.
-    pub fn index(&self) -> &FlatIndex {
+    pub fn index(&self) -> &AnyIndex {
         &self.index
+    }
+
+    /// Which index backend this database uses.
+    pub fn index_kind(&self) -> IndexKind {
+        self.index.kind()
     }
 }
 

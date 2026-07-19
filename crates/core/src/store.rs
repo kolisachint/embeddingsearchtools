@@ -1,9 +1,15 @@
-//! On-disk persistence for a [`FlatIndex`].
+//! On-disk persistence for an [`AnyIndex`].
 //!
 //! Layout (a directory):
-//! - `manifest.json` — dim, metric, model id, row/live counts, format version.
+//! - `manifest.json` — dim, metric, index kind, model id, row/live counts,
+//!   format version.
 //! - `ids.json`      — array aligned to matrix rows; `null` marks a tombstone.
 //! - `vectors.bin`   — raw little-endian `f32`, row-major, `rows * dim` values.
+//!
+//! Only the vectors are persisted — both backends share this layout. The exact
+//! [`FlatIndex`](crate::FlatIndex) needs nothing more; the approximate
+//! [`HnswIndex`](crate::HnswIndex) rebuilds its navigation graph from these
+//! vectors on load, so the on-disk format is identical regardless of backend.
 //!
 //! `vectors.bin` is a flat `f32` buffer specifically so it can be memory-mapped
 //! by future backends; the current loader reads it with buffered IO. Writes go
@@ -11,7 +17,7 @@
 //! existing store.
 
 use crate::error::{Error, Result};
-use crate::index::{FlatIndex, Index, Metric};
+use crate::index::{AnyIndex, Index, IndexKind, Metric};
 use serde::{Deserialize, Serialize};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -26,6 +32,10 @@ struct Manifest {
     format_version: u32,
     dim: usize,
     metric: Metric,
+    /// Index backend. Defaults to `flat` so stores written before this field
+    /// existed still load as exact indexes.
+    #[serde(default)]
+    index: IndexKind,
     model_id: String,
     /// Physical rows in `vectors.bin` (live + tombstoned).
     rows: usize,
@@ -34,7 +44,7 @@ struct Manifest {
 }
 
 /// Write `index` to `dir`, creating it if needed. Atomic per-file.
-pub fn save(dir: impl AsRef<Path>, index: &FlatIndex, model_id: &str) -> Result<()> {
+pub fn save(dir: impl AsRef<Path>, index: &AnyIndex, model_id: &str) -> Result<()> {
     let dir = dir.as_ref();
     std::fs::create_dir_all(dir)?;
     let (data, ids) = index.parts();
@@ -43,6 +53,7 @@ pub fn save(dir: impl AsRef<Path>, index: &FlatIndex, model_id: &str) -> Result<
         format_version: FORMAT_VERSION,
         dim: index.dim(),
         metric: index.metric(),
+        index: index.kind(),
         model_id: model_id.to_string(),
         rows: ids.len(),
         live: index.len(),
@@ -69,7 +80,10 @@ pub fn save(dir: impl AsRef<Path>, index: &FlatIndex, model_id: &str) -> Result<
 /// was saved. [`crate::Database::open`] verifies that id against its embedder;
 /// callers loading a store directly (e.g. tooling without an embedder) should do
 /// the same check themselves before mixing vectors from different models.
-pub fn load(dir: impl AsRef<Path>) -> Result<(FlatIndex, String)> {
+///
+/// An HNSW-backed store rebuilds its navigation graph from the persisted vectors
+/// here, so loading is `O(n log n)` for that backend versus `O(n)` for flat.
+pub fn load(dir: impl AsRef<Path>) -> Result<(AnyIndex, String)> {
     let dir = dir.as_ref();
 
     let manifest: Manifest = {
@@ -109,7 +123,7 @@ pub fn load(dir: impl AsRef<Path>) -> Result<(FlatIndex, String)> {
         )));
     }
 
-    let index = FlatIndex::from_parts(manifest.dim, manifest.metric, data, ids)?;
+    let index = AnyIndex::from_parts(manifest.index, manifest.dim, manifest.metric, data, ids)?;
     Ok((index, manifest.model_id))
 }
 

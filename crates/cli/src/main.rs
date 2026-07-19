@@ -13,7 +13,7 @@
 mod serve;
 
 use clap::{Parser, Subcommand};
-use embsearch_core::{Database, Embedder, Index, Metric};
+use embsearch_core::{Database, Embedder, Index, IndexKind, Metric};
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -92,6 +92,12 @@ struct StoreArgs {
     /// conflicting flag only produces a warning.
     #[arg(short, long)]
     metric: Option<String>,
+    /// Index backend: flat|hnsw. `flat` is exact brute-force; `hnsw` is an
+    /// approximate graph index that is far faster at scale for a small recall
+    /// cost. Used when creating a new store (default: flat); an existing store
+    /// keeps its backend, and a conflicting flag only produces a warning.
+    #[arg(short = 'x', long)]
+    index: Option<String>,
     /// Override the model directory (with `--features onnx`): a dir holding
     /// `model.onnx` + `tokenizer.json`. Ignored by the default mock build.
     #[arg(long)]
@@ -160,10 +166,11 @@ fn run() -> embsearch_core::Result<()> {
         Command::Serve { store } => {
             let db = open_db(&store)?;
             eprintln!(
-                "embsearch daemon ready: {} vectors, model '{}', dim {}",
+                "embsearch daemon ready: {} vectors, model '{}', dim {}, {} index",
                 db.len(),
                 db.embedder().model_id(),
-                db.embedder().dim()
+                db.embedder().dim(),
+                db.index_kind()
             );
             let stdin = std::io::stdin();
             let stdout = std::io::stdout();
@@ -222,14 +229,33 @@ fn cmd_index(store: StoreArgs, input: String) -> embsearch_core::Result<()> {
 /// a warning is printed to stderr.
 fn open_db(store: &StoreArgs) -> embsearch_core::Result<Database<Box<dyn Embedder>>> {
     let requested: Option<Metric> = store.metric.as_deref().map(str::parse).transpose()?;
+    let requested_index: Option<IndexKind> = store.index.as_deref().map(str::parse).transpose()?;
+    let existed = embsearch_core::store::exists(&store.path);
     let embedder = build_embedder(store)?;
-    let db = Database::open_or_create(embedder, &store.path, requested.unwrap_or(Metric::Cosine))?;
+    let db = Database::open_or_create_with(
+        embedder,
+        &store.path,
+        requested.unwrap_or(Metric::Cosine),
+        requested_index.unwrap_or(IndexKind::Flat),
+    )?;
     if let Some(requested) = requested {
         let stored = db.index().metric();
         if stored != requested {
             eprintln!(
                 "warning: --metric {requested} ignored: existing store at {} uses metric \
                  '{stored}' (the stored metric is authoritative; re-index to change it)",
+                store.path.display()
+            );
+        }
+    }
+    // The index backend, like the metric, is fixed when the store is created.
+    if let Some(requested_index) = requested_index {
+        let stored = db.index_kind();
+        if existed && stored != requested_index {
+            eprintln!(
+                "warning: --index {requested_index} ignored: existing store at {} uses the \
+                 '{stored}' backend (the stored backend is authoritative; re-index into a new \
+                 store to change it)",
                 store.path.display()
             );
         }

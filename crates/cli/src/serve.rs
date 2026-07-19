@@ -104,6 +104,8 @@ struct OkResponse {
     model_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     dim: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    index: Option<String>,
 }
 
 impl OkResponse {
@@ -118,6 +120,7 @@ impl OkResponse {
             updated_count: None,
             model_id: None,
             dim: None,
+            index: None,
         }
     }
 }
@@ -241,6 +244,7 @@ fn handle<E: Embedder>(
             r.model_id = Some(db.embedder().model_id().to_string());
             r.dim = Some(db.embedder().dim());
             r.count = Some(db.len());
+            r.index = Some(db.index_kind().to_string());
             Response::Ok(r)
         }
         Request::Save => match store_dir {

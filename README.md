@@ -11,7 +11,7 @@ Three decoupled layers, so the engine plugs into different workflows:
 | Layer | What it does | Swap point |
 |-------|--------------|-----------|
 | **Embedder** (`Embedder` trait) | text → vector | `MockEmbedder` (default) or `MiniLmEmbedder` (`--features onnx`) |
-| **Index** (`Index` trait) | exact top-k vector search | `FlatIndex` today; HNSW can drop in later |
+| **Index** (`Index` trait) | top-k vector search | `FlatIndex` (exact) or `HnswIndex` (approximate), selected per store |
 | **Store** (`store` module) | atomic, mmap-friendly persistence | raw `f32` matrix + JSON manifest |
 
 `Database` composes the three into the primary API: **index, query, update**.
@@ -42,12 +42,39 @@ return fewer than `k` hits. This mirrors the filtering the TS client already
 does client-side, as defense for other callers. `euclidean` scores are negated
 distances — legitimately negative — and are never filtered.
 
+### Index backend: exact vs approximate
+
+The search backend is chosen per store and fixed at creation, exactly like the
+metric (a conflicting `--index` on an existing store warns and is ignored):
+
+- **`flat`** (default) — `FlatIndex`, exact brute-force. Every query scans every
+  live vector. Simple, always correct, and fast to a few hundred thousand
+  vectors.
+- **`hnsw`** — `HnswIndex`, an approximate **Hierarchical Navigable Small World**
+  graph. Queries walk a layered proximity graph in roughly `O(log n)` instead of
+  `O(n)`, trading a little recall for a large speedup at scale.
+
+Both backends share the same storage, so results are directly comparable: HNSW
+returns the same score for a hit that `flat` would, and applies the same
+non-positive-score filtering. Recall against exact search is high (>0.9 @k=10 in
+the test harness); the diversity heuristic used when building the graph keeps
+even orthogonal outliers reachable.
+
+**The graph is never written to disk.** Only the vectors are persisted (identical
+on-disk format for both backends); an HNSW store rebuilds its graph from those
+vectors when opened. That keeps the format simple and mmap-friendly, but means a
+one-shot CLI command against a large HNSW store re-pays graph construction each
+time. The intended path for HNSW is the long-lived `serve` daemon, which builds
+the graph **once** at startup and keeps it hot — the same reason the daemon
+exists for model loading.
+
 ### Efficient updates
 
-`FlatIndex` supports `add` / `update` / `upsert` / `remove` without rebuilding.
-Deletes are tombstoned for O(1) removal and stable rows; `compact` reclaims them.
-Persistence writes each file atomically (temp + rename) so a crash mid-save can't
-corrupt an existing store.
+Both backends support `add` / `update` / `upsert` / `remove` without a full
+rebuild. Deletes are tombstoned for O(1) removal and stable rows; `compact`
+reclaims them (and rebuilds the HNSW graph over the survivors). Persistence
+writes each file atomically (temp + rename) so a crash mid-save can't corrupt an
+existing store.
 
 ## Footprint
 
@@ -67,6 +94,8 @@ cargo build --release --features onnx
 
 # Bulk-index a JSONL file of {"id","text"} records ("-" reads stdin)
 embsearch index --path ./store --input docs.jsonl
+# ...or build an approximate HNSW store for scale (backend fixed at creation)
+embsearch index --path ./store --index hnsw --input docs.jsonl
 
 # Query
 embsearch query --path ./store "how do vector databases work" -k 5
@@ -81,9 +110,10 @@ embsearch remove --path ./store --id doc42
 embsearch serve  --path ./store
 ```
 
-Flags: `--metric cosine|dot|euclidean` (used when creating a store),
-`--model <dir>` (override bundled weights with an on-disk `model.onnx` +
-`tokenizer.json`, onnx build only).
+Flags: `--metric cosine|dot|euclidean` and `--index flat|hnsw` (both used only
+when creating a store; an existing store keeps its own), `--model <dir>`
+(override bundled weights with an on-disk `model.onnx` + `tokenizer.json`, onnx
+build only).
 
 ## Daemon protocol (NDJSON)
 
@@ -113,9 +143,9 @@ Responses always carry `ok`: `{"ok":true,"results":[{"id","score"}]}` or
 `{"ok":false,"error":"..."}`. `bulk` embeds the whole batch in one inference
 (the fast path for bulk indexing) and answers
 `{"ok":true,"inserted_count":N,"updated_count":M}`; `info` answers
-`{"ok":true,"model_id":"...","dim":384,"count":N}` so clients can verify the
-backend (e.g. reject the non-semantic mock build) before indexing; `compact`
-reclaims rows tombstoned by `remove`.
+`{"ok":true,"model_id":"...","dim":384,"count":N,"index":"flat|hnsw"}` so clients
+can verify the backend (e.g. reject the non-semantic mock build, or confirm the
+index type) before indexing; `compact` reclaims rows tombstoned by `remove`.
 
 ## TypeScript usage
 
