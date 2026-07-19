@@ -39,11 +39,8 @@ impl Metric {
     /// Score two vectors. Larger = more similar for every metric.
     fn score(self, a: &[f32], b: &[f32]) -> f32 {
         match self {
-            Metric::Cosine | Metric::Dot => dot(a, b),
-            Metric::Euclidean => {
-                let d2: f32 = a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum();
-                -d2.sqrt()
-            }
+            Metric::Cosine | Metric::Dot => crate::simd::dot(a, b),
+            Metric::Euclidean => -crate::simd::sq_euclidean(a, b).sqrt(),
         }
     }
 
@@ -107,11 +104,6 @@ impl std::str::FromStr for IndexKind {
             other => Err(Error::Config(format!("unknown index kind: {other}"))),
         }
     }
-}
-
-#[inline]
-fn dot(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
 /// A single query hit.

@@ -84,6 +84,39 @@ existing store.
   reachable with static-embedding models; MiniLM was chosen for accuracy, which
   moves the realistic budget to ~40 MB.
 
+## Performance
+
+A dependency-free harness measures the scoring kernels and both index backends:
+
+```bash
+cargo run --release -p embsearch-core --example perf          # 10k vectors
+cargo run --release -p embsearch-core --example perf -- 40000 # larger
+```
+
+**Scoring kernels.** The hot path (dot / squared-euclidean over `dim`-length
+vectors) uses multi-accumulator loops that LLVM auto-vectorizes — no `unsafe`, no
+`std::simd`, no external crate. Measured **~3x** throughput over the naive
+single-accumulator reduction at `dim=384`.
+
+**Flat vs HNSW.** On 40k clustered vectors (`dim=384`, cosine), the exact scan
+runs ~9 ms/query while HNSW answers in well under 1 ms. HNSW query cost is
+`O(log n)` so its edge widens with scale; `ef_search` trades recall for latency
+and is tunable at runtime (`HnswIndex::set_ef_search`):
+
+| `ef_search` | recall@10 | speedup vs exact (40k) |
+|------------:|----------:|-----------------------:|
+| 32          | ~36%      | ~34x                   |
+| 128 (default) | ~62%    | ~12x                   |
+| 256         | ~81%      | ~7x                    |
+
+(Recall rises toward exact as `ef_search` grows; at 10k the same settings reach
+~80% / ~96% recall since a fixed `ef` covers more of a smaller graph.)
+
+The tradeoff is **build time**: the flat index just appends vectors, while HNSW
+builds a graph (~10³ vectors/s here, distance-bound). That cost is paid once —
+the `serve` daemon builds the graph at startup and keeps it hot, and searches run
+allocation-free — so HNSW is for the long-lived daemon, not one-shot CLI calls.
+
 ## CLI
 
 ```bash

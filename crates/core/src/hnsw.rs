@@ -27,8 +27,9 @@
 
 use crate::error::Result;
 use crate::index::{Index, Metric, RowStore, SearchResult};
+use std::cell::RefCell;
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::BinaryHeap;
 
 // --- tunables ----------------------------------------------------------------
 
@@ -38,10 +39,11 @@ const M: usize = 16;
 const M0: usize = 32;
 /// Candidate-list size while building the graph. Larger = better graph, slower
 /// inserts.
-const EF_CONSTRUCTION: usize = 200;
+const EF_CONSTRUCTION: usize = 128;
 /// Candidate-list size while querying. Larger = better recall, slower queries.
-/// The effective value is `max(EF_SEARCH, k)`.
-const EF_SEARCH: usize = 64;
+/// The effective value is `max(EF_SEARCH, k)`. Queries are far cheaper than the
+/// exact scan, so this is set generously to keep recall high.
+const EF_SEARCH: usize = 128;
 /// Hard cap on layer count, so a pathological RNG draw can't allocate absurdly.
 const MAX_LEVEL: usize = 16;
 /// Fixed RNG seed: builds are reproducible from the vectors alone.
@@ -69,6 +71,57 @@ impl Ord for Ordf {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.0.total_cmp(&other.0)
     }
+}
+
+// --- visited set (epoch-stamped, allocation-free per search) -----------------
+
+/// A visited-set that avoids per-search allocation. Instead of clearing a
+/// `HashSet` each call, every node carries the epoch it was last stamped with;
+/// bumping the current epoch logically empties the set in O(1). This is the
+/// standard HNSW trick and matters because graph construction runs a search per
+/// insert on every layer — millions of tiny sets otherwise.
+struct Visited {
+    stamp: Vec<u32>,
+    epoch: u32,
+}
+
+impl Visited {
+    fn new() -> Self {
+        Self {
+            stamp: Vec::new(),
+            epoch: 0,
+        }
+    }
+
+    /// Prepare for a search over `n` nodes: grow if needed and start a fresh
+    /// epoch. Handles `u32` wraparound by zeroing (astronomically rare).
+    fn begin(&mut self, n: usize) {
+        if self.stamp.len() < n {
+            self.stamp.resize(n, 0);
+        }
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            self.stamp.iter_mut().for_each(|s| *s = 0);
+            self.epoch = 1;
+        }
+    }
+
+    /// Mark `node` visited, returning `true` if it was newly inserted.
+    #[inline]
+    fn insert(&mut self, node: u32) -> bool {
+        let slot = &mut self.stamp[node as usize];
+        if *slot == self.epoch {
+            false
+        } else {
+            *slot = self.epoch;
+            true
+        }
+    }
+}
+
+thread_local! {
+    /// Per-thread scratch visited-set reused across searches.
+    static VISITED: RefCell<Visited> = RefCell::new(Visited::new());
 }
 
 // --- deterministic RNG (splitmix64) ------------------------------------------
@@ -119,6 +172,10 @@ pub struct HnswIndex {
     max_layer: usize,
     rng: Rng,
     m_l: f64,
+    /// Query-time candidate-list size. Tunable per index; see [`set_ef_search`].
+    ///
+    /// [`set_ef_search`]: HnswIndex::set_ef_search
+    ef_search: usize,
 }
 
 impl HnswIndex {
@@ -131,7 +188,21 @@ impl HnswIndex {
             max_layer: 0,
             rng: Rng::new(SEED),
             m_l: 1.0 / (M as f64).ln(),
+            ef_search: EF_SEARCH,
         }
+    }
+
+    /// Set the query-time candidate-list size (`ef`). Higher values raise recall
+    /// toward exact search at the cost of query latency; the effective value is
+    /// always at least `k`. This only affects [`query`](Index::query) and can be
+    /// changed at any time. The default is 128.
+    pub fn set_ef_search(&mut self, ef: usize) {
+        self.ef_search = ef.max(1);
+    }
+
+    /// The current query-time candidate-list size.
+    pub fn ef_search(&self) -> usize {
+        self.ef_search
     }
 
     /// Number of physical rows including tombstones.
@@ -166,6 +237,7 @@ impl HnswIndex {
             max_layer: 0,
             rng: Rng::new(SEED),
             m_l: 1.0 / (M as f64).ln(),
+            ef_search: EF_SEARCH,
         };
         idx.rebuild_graph();
         Ok(idx)
@@ -262,50 +334,53 @@ impl HnswIndex {
         ef: usize,
         layer: usize,
     ) -> Vec<(f32, u32)> {
-        let mut visited: HashSet<u32> = HashSet::with_capacity(ef * 4);
-        // Candidates: min-heap by distance (explore closest first).
-        let mut candidates: BinaryHeap<Reverse<(Ordf, u32)>> = BinaryHeap::new();
-        // Results: max-heap by distance (the farthest kept result is at the top).
-        let mut results: BinaryHeap<(Ordf, u32)> = BinaryHeap::new();
+        VISITED.with(|v| {
+            let mut visited = v.borrow_mut();
+            visited.begin(self.links.len());
+            // Candidates: min-heap by distance (explore closest first).
+            let mut candidates: BinaryHeap<Reverse<(Ordf, u32)>> = BinaryHeap::new();
+            // Results: max-heap by distance (the farthest kept result is at the top).
+            let mut results: BinaryHeap<(Ordf, u32)> = BinaryHeap::new();
 
-        for &e in entry_points {
-            if visited.insert(e) {
-                let d = self.dist(query, e);
-                candidates.push(Reverse((Ordf(d), e)));
-                results.push((Ordf(d), e));
+            for &e in entry_points {
+                if visited.insert(e) {
+                    let d = self.dist(query, e);
+                    candidates.push(Reverse((Ordf(d), e)));
+                    results.push((Ordf(d), e));
+                }
             }
-        }
 
-        while let Some(Reverse((Ordf(cd), c))) = candidates.pop() {
-            let farthest = match results.peek() {
-                Some(&(Ordf(d), _)) => d,
-                None => break,
-            };
-            // Closest remaining candidate is worse than our worst keeper: done.
-            if cd > farthest {
-                break;
-            }
-            if let Some(nbrs) = self.links[c as usize].get(layer) {
-                for &nb in nbrs {
-                    if visited.insert(nb) {
-                        let d = self.dist(query, nb);
-                        let farthest = results
-                            .peek()
-                            .map(|&(Ordf(d), _)| d)
-                            .unwrap_or(f32::INFINITY);
-                        if results.len() < ef || d < farthest {
-                            candidates.push(Reverse((Ordf(d), nb)));
-                            results.push((Ordf(d), nb));
-                            if results.len() > ef {
-                                results.pop();
+            while let Some(Reverse((Ordf(cd), c))) = candidates.pop() {
+                let farthest = match results.peek() {
+                    Some(&(Ordf(d), _)) => d,
+                    None => break,
+                };
+                // Closest remaining candidate is worse than our worst keeper: done.
+                if cd > farthest {
+                    break;
+                }
+                if let Some(nbrs) = self.links[c as usize].get(layer) {
+                    for &nb in nbrs {
+                        if visited.insert(nb) {
+                            let d = self.dist(query, nb);
+                            let farthest = results
+                                .peek()
+                                .map(|&(Ordf(d), _)| d)
+                                .unwrap_or(f32::INFINITY);
+                            if results.len() < ef || d < farthest {
+                                candidates.push(Reverse((Ordf(d), nb)));
+                                results.push((Ordf(d), nb));
+                                if results.len() > ef {
+                                    results.pop();
+                                }
                             }
                         }
                     }
                 }
             }
-        }
 
-        results.into_iter().map(|(Ordf(d), n)| (d, n)).collect()
+            results.into_iter().map(|(Ordf(d), n)| (d, n)).collect()
+        })
     }
 
     /// Insert the vector already stored at `row` into the graph. Assumes
@@ -490,7 +565,7 @@ impl Index for HnswIndex {
             ep = self.greedy(&q, ep, lc);
         }
 
-        let ef = EF_SEARCH.max(k);
+        let ef = self.ef_search.max(k);
         let found = self.search_layer(&q, &[ep], ef, 0);
 
         let filter = self.store.metric().filters_nonpositive();
@@ -530,6 +605,7 @@ impl Index for HnswIndex {
 mod tests {
     use super::*;
     use crate::FlatIndex;
+    use std::collections::HashSet;
 
     /// Deterministic vector generator for tests.
     fn gen(seed: u64, dim: usize) -> Vec<f32> {

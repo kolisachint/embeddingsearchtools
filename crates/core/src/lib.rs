@@ -25,12 +25,21 @@ mod embed;
 mod error;
 mod hnsw;
 mod index;
+mod simd;
 pub mod store;
 
 pub use embed::{l2_normalize, Embedder, MockEmbedder};
 pub use error::{Error, Result};
 pub use hnsw::HnswIndex;
 pub use index::{AnyIndex, FlatIndex, Index, IndexKind, Metric, SearchResult};
+
+/// Internal kernels exposed only so the `perf` benchmark example can compare the
+/// vectorized scoring loops against their scalar baselines. Not part of the
+/// stable API — do not depend on this module.
+#[doc(hidden)]
+pub mod internals {
+    pub use crate::simd::{dot, dot_scalar, sq_euclidean, sq_euclidean_scalar};
+}
 
 #[cfg(feature = "onnx")]
 pub use embed::MiniLmEmbedder;

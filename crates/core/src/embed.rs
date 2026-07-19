@@ -124,7 +124,7 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 
 /// Normalize a vector to unit L2 length in place. Zero vectors are left as-is.
 pub fn l2_normalize(v: &mut [f32]) {
-    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm = crate::simd::dot(v, v).sqrt();
     if norm > f32::EPSILON {
         for x in v.iter_mut() {
             *x /= norm;
