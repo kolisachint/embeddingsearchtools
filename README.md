@@ -11,7 +11,8 @@ Three decoupled layers, so the engine plugs into different workflows:
 | Layer | What it does | Swap point |
 |-------|--------------|-----------|
 | **Embedder** (`Embedder` trait) | text → vector | `MockEmbedder` (default) or `MiniLmEmbedder` (`--features onnx`) |
-| **Index** (`Index` trait) | exact top-k vector search | `FlatIndex` today; HNSW can drop in later |
+| **Index** (`Index` trait) | top-k vector search | `FlatIndex` (exact) or `HnswIndex` (approximate), selected per store |
+| **Lexical** (`LexicalIndex`) | BM25 keyword search | optional, enables hybrid retrieval |
 | **Store** (`store` module) | atomic, mmap-friendly persistence | raw `f32` matrix + JSON manifest |
 
 `Database` composes the three into the primary API: **index, query, update**.
@@ -42,12 +43,54 @@ return fewer than `k` hits. This mirrors the filtering the TS client already
 does client-side, as defense for other callers. `euclidean` scores are negated
 distances — legitimately negative — and are never filtered.
 
+### Index backend: exact vs approximate
+
+The search backend is chosen per store and fixed at creation, exactly like the
+metric (a conflicting `--index` on an existing store warns and is ignored):
+
+- **`flat`** (default) — `FlatIndex`, exact brute-force. Every query scans every
+  live vector. Simple, always correct, and fast to a few hundred thousand
+  vectors.
+- **`hnsw`** — `HnswIndex`, an approximate **Hierarchical Navigable Small World**
+  graph. Queries walk a layered proximity graph in roughly `O(log n)` instead of
+  `O(n)`, trading a little recall for a large speedup at scale.
+
+Both backends share the same storage, so results are directly comparable: HNSW
+returns the same score for a hit that `flat` would, and applies the same
+non-positive-score filtering. Recall against exact search is high (>0.9 @k=10 in
+the test harness); the diversity heuristic used when building the graph keeps
+even orthogonal outliers reachable.
+
+**The graph is never written to disk.** Only the vectors are persisted (identical
+on-disk format for both backends); an HNSW store rebuilds its graph from those
+vectors when opened. That keeps the format simple and mmap-friendly, but means a
+one-shot CLI command against a large HNSW store re-pays graph construction each
+time. The intended path for HNSW is the long-lived `serve` daemon, which builds
+the graph **once** at startup and keeps it hot — the same reason the daemon
+exists for model loading.
+
+### Hybrid search (vector + BM25)
+
+Dense vectors match on *meaning* but can miss exact terms — rare identifiers,
+codes, names — that a smoothed embedding washes out. A store created with
+`--hybrid` keeps an Okapi BM25 lexical index (`LexicalIndex`) alongside the
+vectors; `query --hybrid` runs both retrievers and fuses their rankings with
+**Reciprocal Rank Fusion** (combine by rank, not score, so the incomparable
+cosine and BM25 scales need no normalization). Hybrid mode is fixed at creation
+and preserved across reopens, like the metric and backend.
+
+Only the texts are persisted (`texts.json`); the BM25 postings, like the HNSW
+graph, are rebuilt on load. Fusion cost is dominated by the vector search — the
+lexical side is a cheap postings walk — so a hybrid query costs about the same as
+a vector query plus a small constant.
+
 ### Efficient updates
 
-`FlatIndex` supports `add` / `update` / `upsert` / `remove` without rebuilding.
-Deletes are tombstoned for O(1) removal and stable rows; `compact` reclaims them.
-Persistence writes each file atomically (temp + rename) so a crash mid-save can't
-corrupt an existing store.
+Both backends support `add` / `update` / `upsert` / `remove` without a full
+rebuild. Deletes are tombstoned for O(1) removal and stable rows; `compact`
+reclaims them (and rebuilds the HNSW graph over the survivors). The lexical index
+tracks the same mutations. Persistence writes each file atomically (temp +
+rename) so a crash mid-save can't corrupt an existing store.
 
 ## Footprint
 
@@ -56,6 +99,57 @@ corrupt an existing store.
   + ≈10–15 MB ONNX Runtime + binary). *Note:* the original 10–15 MB target is only
   reachable with static-embedding models; MiniLM was chosen for accuracy, which
   moves the realistic budget to ~40 MB.
+
+## Performance
+
+A dependency-free harness measures the scoring kernels and both index backends:
+
+```bash
+cargo run --release -p embsearch-core --example perf          # 10k vectors
+cargo run --release -p embsearch-core --example perf -- 40000 # larger
+```
+
+**Scoring kernels.** The hot path (dot / squared-euclidean over `dim`-length
+vectors) uses multi-accumulator loops that LLVM auto-vectorizes — no `unsafe`, no
+`std::simd`, no external crate. Measured **~3x** throughput over the naive
+single-accumulator reduction at `dim=384`.
+
+**Flat vs HNSW.** `FlatIndex` is exact — recall is always 100%. `HnswIndex` is
+approximate: it answers in `O(log n)` instead of scanning every vector, so its
+speed edge widens with scale, and `ef_search` trades recall for latency. The
+default `ef_search=200` **favors accuracy** (`HnswIndex::set_ef_search` tunes it
+at runtime). On 10k clustered vectors (`dim=384`, cosine), against the exact scan:
+
+| `ef_search` | recall@10 | speedup vs exact |
+|------------:|----------:|-----------------:|
+| 16          | ~46%      | ~13x             |
+| 64          | ~74%      | ~8x              |
+| 128         | ~87%      | ~4x              |
+| **200 (default)** | **~94%** | **~2.5x**  |
+| 256         | ~98%      | ~2x              |
+
+Recall falls as the dataset grows at a *fixed* `ef` (a constant candidate list
+covers a smaller fraction of a larger graph): the default reaches ~94% at 10k and
+~82% at 40k, so raise `ef_search` for larger corpora. Because HNSW gets
+disproportionately faster at scale (~50x at 40k, low `ef`), you can afford a much
+larger `ef` there and still beat the exact scan.
+
+The tradeoff is **build time**: the flat index just appends vectors, while HNSW
+builds a graph (~10³ vectors/s here, distance-bound; the accuracy-first
+`ef_construction=200` is part of that cost). It is paid once — the `serve` daemon
+builds the graph at startup and keeps it hot, and searches then run
+allocation-free — so HNSW is for the long-lived daemon, not one-shot CLI calls.
+
+### Accuracy summary
+
+| Backend | Recall | When |
+|---------|--------|------|
+| `flat` | **exact (100%)** | correctness matters, or up to a few 100k vectors |
+| `hnsw` | **~94% default, tunable to ~98%+** | large corpora where query latency dominates |
+| `--hybrid` | improves *relevance* (not recall vs vectors) | queries with exact terms embeddings blur |
+
+The default is `flat` — exact — so you opt into approximation deliberately. When
+you do, the harness above measures the actual recall for your data and settings.
 
 ## CLI
 
@@ -67,10 +161,16 @@ cargo build --release --features onnx
 
 # Bulk-index a JSONL file of {"id","text"} records ("-" reads stdin)
 embsearch index --path ./store --input docs.jsonl
+# ...or build an approximate HNSW store for scale (backend fixed at creation)
+embsearch index --path ./store --index hnsw --input docs.jsonl
 
 # Query
 embsearch query --path ./store "how do vector databases work" -k 5
 embsearch query --path ./store "..." -k 5 --json
+
+# Hybrid: build with a BM25 keyword index, then fuse vector + keyword results
+embsearch index --path ./hstore --hybrid --input docs.jsonl
+embsearch query --path ./hstore --hybrid "kubernetes ingress" -k 5
 
 # Single-record mutations
 embsearch add    --path ./store --id doc42 --text "some text"
@@ -81,9 +181,10 @@ embsearch remove --path ./store --id doc42
 embsearch serve  --path ./store
 ```
 
-Flags: `--metric cosine|dot|euclidean` (used when creating a store),
-`--model <dir>` (override bundled weights with an on-disk `model.onnx` +
-`tokenizer.json`, onnx build only).
+Flags: `--metric cosine|dot|euclidean`, `--index flat|hnsw`, and `--hybrid` (all
+fixed when a store is created; an existing store keeps its own — `--hybrid` also
+selects fused ranking at query time), `--model <dir>` (override bundled weights
+with an on-disk `model.onnx` + `tokenizer.json`, onnx build only).
 
 ## Daemon protocol (NDJSON)
 
@@ -96,6 +197,7 @@ Requests:
 ```json
 {"op":"query","text":"...","k":5}
 {"op":"query","vector":[/* dim floats */],"k":5}
+{"op":"query","text":"...","k":5,"hybrid":true}
 {"op":"add","id":"x","text":"..."}
 {"op":"update","id":"x","text":"..."}
 {"op":"upsert","id":"x","text":"..."}
@@ -113,9 +215,11 @@ Responses always carry `ok`: `{"ok":true,"results":[{"id","score"}]}` or
 `{"ok":false,"error":"..."}`. `bulk` embeds the whole batch in one inference
 (the fast path for bulk indexing) and answers
 `{"ok":true,"inserted_count":N,"updated_count":M}`; `info` answers
-`{"ok":true,"model_id":"...","dim":384,"count":N}` so clients can verify the
-backend (e.g. reject the non-semantic mock build) before indexing; `compact`
-reclaims rows tombstoned by `remove`.
+`{"ok":true,"model_id":"...","dim":384,"count":N,"index":"flat|hnsw","hybrid":bool}`
+so clients can verify the backend (e.g. reject the non-semantic mock build, or
+confirm the index type) before indexing; `compact` reclaims rows tombstoned by
+`remove`. Adding `"hybrid":true` to a `query` on a hybrid store fuses vector and
+BM25 results (`text` only — a precomputed `vector` can't be tokenized).
 
 ## TypeScript usage
 

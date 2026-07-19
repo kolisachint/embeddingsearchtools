@@ -28,6 +28,10 @@ export interface DaemonInfo {
   modelId: string;
   dim: number;
   count: number;
+  /** Index backend the store uses: `"flat"` (exact) or `"hnsw"` (approximate). */
+  index: string;
+  /** Whether the store also carries a BM25 lexical index for hybrid search. */
+  hybrid: boolean;
 }
 
 export interface BulkResult {
@@ -116,9 +120,16 @@ export class EmbSearchClient {
     });
   }
 
-  /** Search for the top-`k` matches for `text`. */
-  async query(text: string, k = 10): Promise<SearchResult[]> {
-    const res = await this.send({ op: "query", text, k });
+  /**
+   * Search for the top-`k` matches for `text`. Pass `{ hybrid: true }` to fuse
+   * semantic (vector) and keyword (BM25) results — requires a hybrid store.
+   */
+  async query(
+    text: string,
+    k = 10,
+    opts: { hybrid?: boolean } = {},
+  ): Promise<SearchResult[]> {
+    const res = await this.send({ op: "query", text, k, hybrid: opts.hybrid ?? false });
     return res.results ?? [];
   }
 
@@ -135,13 +146,15 @@ export class EmbSearchClient {
     };
   }
 
-  /** Model id, dimensionality, and live vector count of the daemon. */
+  /** Model id, dimensionality, live vector count, and index backend. */
   async info(): Promise<DaemonInfo> {
     const res = await this.send({ op: "info" });
     return {
       modelId: res.model_id ?? "",
       dim: res.dim ?? 0,
       count: res.count ?? 0,
+      index: res.index ?? "flat",
+      hybrid: res.hybrid ?? false,
     };
   }
 

@@ -1,9 +1,15 @@
-//! On-disk persistence for a [`FlatIndex`].
+//! On-disk persistence for an [`AnyIndex`].
 //!
 //! Layout (a directory):
-//! - `manifest.json` — dim, metric, model id, row/live counts, format version.
+//! - `manifest.json` — dim, metric, index kind, model id, row/live counts,
+//!   format version.
 //! - `ids.json`      — array aligned to matrix rows; `null` marks a tombstone.
 //! - `vectors.bin`   — raw little-endian `f32`, row-major, `rows * dim` values.
+//!
+//! Only the vectors are persisted — both backends share this layout. The exact
+//! [`FlatIndex`](crate::FlatIndex) needs nothing more; the approximate
+//! [`HnswIndex`](crate::HnswIndex) rebuilds its navigation graph from these
+//! vectors on load, so the on-disk format is identical regardless of backend.
 //!
 //! `vectors.bin` is a flat `f32` buffer specifically so it can be memory-mapped
 //! by future backends; the current loader reads it with buffered IO. Writes go
@@ -11,8 +17,9 @@
 //! existing store.
 
 use crate::error::{Error, Result};
-use crate::index::{FlatIndex, Index, Metric};
+use crate::index::{AnyIndex, Index, IndexKind, Metric};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -20,12 +27,21 @@ const FORMAT_VERSION: u32 = 1;
 const MANIFEST: &str = "manifest.json";
 const IDS: &str = "ids.json";
 const VECTORS: &str = "vectors.bin";
+const TEXTS: &str = "texts.json";
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Manifest {
     format_version: u32,
     dim: usize,
     metric: Metric,
+    /// Index backend. Defaults to `flat` so stores written before this field
+    /// existed still load as exact indexes.
+    #[serde(default)]
+    index: IndexKind,
+    /// Whether a BM25 lexical index (and `texts.json`) accompanies the vectors.
+    /// Defaults to `false` for backward compatibility.
+    #[serde(default)]
+    hybrid: bool,
     model_id: String,
     /// Physical rows in `vectors.bin` (live + tombstoned).
     rows: usize,
@@ -33,8 +49,10 @@ struct Manifest {
     live: usize,
 }
 
-/// Write `index` to `dir`, creating it if needed. Atomic per-file.
-pub fn save(dir: impl AsRef<Path>, index: &FlatIndex, model_id: &str) -> Result<()> {
+/// Write `index` to `dir`, creating it if needed. Atomic per-file. `hybrid`
+/// records whether a companion `texts.json` (written separately via
+/// [`save_texts`]) is expected on load.
+pub fn save(dir: impl AsRef<Path>, index: &AnyIndex, model_id: &str, hybrid: bool) -> Result<()> {
     let dir = dir.as_ref();
     std::fs::create_dir_all(dir)?;
     let (data, ids) = index.parts();
@@ -43,6 +61,8 @@ pub fn save(dir: impl AsRef<Path>, index: &FlatIndex, model_id: &str) -> Result<
         format_version: FORMAT_VERSION,
         dim: index.dim(),
         metric: index.metric(),
+        index: index.kind(),
+        hybrid,
         model_id: model_id.to_string(),
         rows: ids.len(),
         live: index.len(),
@@ -69,7 +89,14 @@ pub fn save(dir: impl AsRef<Path>, index: &FlatIndex, model_id: &str) -> Result<
 /// was saved. [`crate::Database::open`] verifies that id against its embedder;
 /// callers loading a store directly (e.g. tooling without an embedder) should do
 /// the same check themselves before mixing vectors from different models.
-pub fn load(dir: impl AsRef<Path>) -> Result<(FlatIndex, String)> {
+///
+/// An HNSW-backed store rebuilds its navigation graph from the persisted vectors
+/// here, so loading is `O(n log n)` for that backend versus `O(n)` for flat.
+///
+/// The third tuple element is the `hybrid` flag: when true a companion
+/// `texts.json` exists and should be read with [`load_texts`] to rebuild the
+/// lexical index.
+pub fn load(dir: impl AsRef<Path>) -> Result<(AnyIndex, String, bool)> {
     let dir = dir.as_ref();
 
     let manifest: Manifest = {
@@ -109,8 +136,25 @@ pub fn load(dir: impl AsRef<Path>) -> Result<(FlatIndex, String)> {
         )));
     }
 
-    let index = FlatIndex::from_parts(manifest.dim, manifest.metric, data, ids)?;
-    Ok((index, manifest.model_id))
+    let index = AnyIndex::from_parts(manifest.index, manifest.dim, manifest.metric, data, ids)?;
+    Ok((index, manifest.model_id, manifest.hybrid))
+}
+
+/// Persist the id → text map for a hybrid store's lexical index. Atomic.
+pub fn save_texts(dir: impl AsRef<Path>, texts: &HashMap<String, String>) -> Result<()> {
+    let dir = dir.as_ref();
+    std::fs::create_dir_all(dir)?;
+    write_atomic(&dir.join(TEXTS), |w| {
+        serde_json::to_writer(BufWriter::new(w), texts).map_err(Error::from)
+    })
+}
+
+/// Load the id → text map written by [`save_texts`].
+pub fn load_texts(dir: impl AsRef<Path>) -> Result<HashMap<String, String>> {
+    let path = dir.as_ref().join(TEXTS);
+    let f = std::fs::File::open(&path)?;
+    serde_json::from_reader(BufReader::new(f))
+        .map_err(|e| Error::corrupt(format!("invalid {TEXTS}: {e}")))
 }
 
 /// True if `dir` looks like an existing store (has a manifest).
