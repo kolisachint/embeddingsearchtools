@@ -19,6 +19,7 @@
 use crate::error::{Error, Result};
 use crate::index::{AnyIndex, Index, IndexKind, Metric};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -26,6 +27,7 @@ const FORMAT_VERSION: u32 = 1;
 const MANIFEST: &str = "manifest.json";
 const IDS: &str = "ids.json";
 const VECTORS: &str = "vectors.bin";
+const TEXTS: &str = "texts.json";
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Manifest {
@@ -36,6 +38,10 @@ struct Manifest {
     /// existed still load as exact indexes.
     #[serde(default)]
     index: IndexKind,
+    /// Whether a BM25 lexical index (and `texts.json`) accompanies the vectors.
+    /// Defaults to `false` for backward compatibility.
+    #[serde(default)]
+    hybrid: bool,
     model_id: String,
     /// Physical rows in `vectors.bin` (live + tombstoned).
     rows: usize,
@@ -43,8 +49,10 @@ struct Manifest {
     live: usize,
 }
 
-/// Write `index` to `dir`, creating it if needed. Atomic per-file.
-pub fn save(dir: impl AsRef<Path>, index: &AnyIndex, model_id: &str) -> Result<()> {
+/// Write `index` to `dir`, creating it if needed. Atomic per-file. `hybrid`
+/// records whether a companion `texts.json` (written separately via
+/// [`save_texts`]) is expected on load.
+pub fn save(dir: impl AsRef<Path>, index: &AnyIndex, model_id: &str, hybrid: bool) -> Result<()> {
     let dir = dir.as_ref();
     std::fs::create_dir_all(dir)?;
     let (data, ids) = index.parts();
@@ -54,6 +62,7 @@ pub fn save(dir: impl AsRef<Path>, index: &AnyIndex, model_id: &str) -> Result<(
         dim: index.dim(),
         metric: index.metric(),
         index: index.kind(),
+        hybrid,
         model_id: model_id.to_string(),
         rows: ids.len(),
         live: index.len(),
@@ -83,7 +92,11 @@ pub fn save(dir: impl AsRef<Path>, index: &AnyIndex, model_id: &str) -> Result<(
 ///
 /// An HNSW-backed store rebuilds its navigation graph from the persisted vectors
 /// here, so loading is `O(n log n)` for that backend versus `O(n)` for flat.
-pub fn load(dir: impl AsRef<Path>) -> Result<(AnyIndex, String)> {
+///
+/// The third tuple element is the `hybrid` flag: when true a companion
+/// `texts.json` exists and should be read with [`load_texts`] to rebuild the
+/// lexical index.
+pub fn load(dir: impl AsRef<Path>) -> Result<(AnyIndex, String, bool)> {
     let dir = dir.as_ref();
 
     let manifest: Manifest = {
@@ -124,7 +137,24 @@ pub fn load(dir: impl AsRef<Path>) -> Result<(AnyIndex, String)> {
     }
 
     let index = AnyIndex::from_parts(manifest.index, manifest.dim, manifest.metric, data, ids)?;
-    Ok((index, manifest.model_id))
+    Ok((index, manifest.model_id, manifest.hybrid))
+}
+
+/// Persist the id → text map for a hybrid store's lexical index. Atomic.
+pub fn save_texts(dir: impl AsRef<Path>, texts: &HashMap<String, String>) -> Result<()> {
+    let dir = dir.as_ref();
+    std::fs::create_dir_all(dir)?;
+    write_atomic(&dir.join(TEXTS), |w| {
+        serde_json::to_writer(BufWriter::new(w), texts).map_err(Error::from)
+    })
+}
+
+/// Load the id → text map written by [`save_texts`].
+pub fn load_texts(dir: impl AsRef<Path>) -> Result<HashMap<String, String>> {
+    let path = dir.as_ref().join(TEXTS);
+    let f = std::fs::File::open(&path)?;
+    serde_json::from_reader(BufReader::new(f))
+        .map_err(|e| Error::corrupt(format!("invalid {TEXTS}: {e}")))
 }
 
 /// True if `dir` looks like an existing store (has a manifest).

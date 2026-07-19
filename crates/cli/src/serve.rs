@@ -42,6 +42,9 @@ enum Request {
         vector: Option<Vec<f32>>,
         #[serde(default = "default_k")]
         k: usize,
+        /// Fuse vector + BM25 results (requires a hybrid store and `text`).
+        #[serde(default)]
+        hybrid: bool,
     },
     Add {
         id: String,
@@ -106,6 +109,8 @@ struct OkResponse {
     dim: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     index: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hybrid: Option<bool>,
 }
 
 impl OkResponse {
@@ -121,6 +126,7 @@ impl OkResponse {
             model_id: None,
             dim: None,
             index: None,
+            hybrid: None,
         }
     }
 }
@@ -179,11 +185,20 @@ fn handle<E: Embedder>(
             r.count = Some(db.len());
             Response::Ok(r)
         }
-        Request::Query { text, vector, k } => {
+        Request::Query {
+            text,
+            vector,
+            k,
+            hybrid,
+        } => {
+            if hybrid && vector.is_some() {
+                return Response::error("hybrid query requires `text`, not `vector`");
+            }
             let result = match (text, vector) {
                 (Some(_), Some(_)) => {
                     return Response::error("query accepts text or vector, not both");
                 }
+                (Some(t), None) if hybrid => db.query_hybrid(&t, k),
                 (Some(t), None) => db.query(&t, k),
                 (None, Some(v)) => db.query_vector(&v, k),
                 (None, None) => {
@@ -245,6 +260,7 @@ fn handle<E: Embedder>(
             r.dim = Some(db.embedder().dim());
             r.count = Some(db.len());
             r.index = Some(db.index_kind().to_string());
+            r.hybrid = Some(db.is_hybrid());
             Response::Ok(r)
         }
         Request::Save => match store_dir {

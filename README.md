@@ -12,6 +12,7 @@ Three decoupled layers, so the engine plugs into different workflows:
 |-------|--------------|-----------|
 | **Embedder** (`Embedder` trait) | text → vector | `MockEmbedder` (default) or `MiniLmEmbedder` (`--features onnx`) |
 | **Index** (`Index` trait) | top-k vector search | `FlatIndex` (exact) or `HnswIndex` (approximate), selected per store |
+| **Lexical** (`LexicalIndex`) | BM25 keyword search | optional, enables hybrid retrieval |
 | **Store** (`store` module) | atomic, mmap-friendly persistence | raw `f32` matrix + JSON manifest |
 
 `Database` composes the three into the primary API: **index, query, update**.
@@ -68,13 +69,28 @@ time. The intended path for HNSW is the long-lived `serve` daemon, which builds
 the graph **once** at startup and keeps it hot — the same reason the daemon
 exists for model loading.
 
+### Hybrid search (vector + BM25)
+
+Dense vectors match on *meaning* but can miss exact terms — rare identifiers,
+codes, names — that a smoothed embedding washes out. A store created with
+`--hybrid` keeps an Okapi BM25 lexical index (`LexicalIndex`) alongside the
+vectors; `query --hybrid` runs both retrievers and fuses their rankings with
+**Reciprocal Rank Fusion** (combine by rank, not score, so the incomparable
+cosine and BM25 scales need no normalization). Hybrid mode is fixed at creation
+and preserved across reopens, like the metric and backend.
+
+Only the texts are persisted (`texts.json`); the BM25 postings, like the HNSW
+graph, are rebuilt on load. Fusion cost is dominated by the vector search — the
+lexical side is a cheap postings walk — so a hybrid query costs about the same as
+a vector query plus a small constant.
+
 ### Efficient updates
 
 Both backends support `add` / `update` / `upsert` / `remove` without a full
 rebuild. Deletes are tombstoned for O(1) removal and stable rows; `compact`
-reclaims them (and rebuilds the HNSW graph over the survivors). Persistence
-writes each file atomically (temp + rename) so a crash mid-save can't corrupt an
-existing store.
+reclaims them (and rebuilds the HNSW graph over the survivors). The lexical index
+tracks the same mutations. Persistence writes each file atomically (temp +
+rename) so a crash mid-save can't corrupt an existing store.
 
 ## Footprint
 
@@ -134,6 +150,10 @@ embsearch index --path ./store --index hnsw --input docs.jsonl
 embsearch query --path ./store "how do vector databases work" -k 5
 embsearch query --path ./store "..." -k 5 --json
 
+# Hybrid: build with a BM25 keyword index, then fuse vector + keyword results
+embsearch index --path ./hstore --hybrid --input docs.jsonl
+embsearch query --path ./hstore --hybrid "kubernetes ingress" -k 5
+
 # Single-record mutations
 embsearch add    --path ./store --id doc42 --text "some text"
 embsearch update --path ./store --id doc42 --text "new text"
@@ -143,10 +163,10 @@ embsearch remove --path ./store --id doc42
 embsearch serve  --path ./store
 ```
 
-Flags: `--metric cosine|dot|euclidean` and `--index flat|hnsw` (both used only
-when creating a store; an existing store keeps its own), `--model <dir>`
-(override bundled weights with an on-disk `model.onnx` + `tokenizer.json`, onnx
-build only).
+Flags: `--metric cosine|dot|euclidean`, `--index flat|hnsw`, and `--hybrid` (all
+fixed when a store is created; an existing store keeps its own — `--hybrid` also
+selects fused ranking at query time), `--model <dir>` (override bundled weights
+with an on-disk `model.onnx` + `tokenizer.json`, onnx build only).
 
 ## Daemon protocol (NDJSON)
 
@@ -159,6 +179,7 @@ Requests:
 ```json
 {"op":"query","text":"...","k":5}
 {"op":"query","vector":[/* dim floats */],"k":5}
+{"op":"query","text":"...","k":5,"hybrid":true}
 {"op":"add","id":"x","text":"..."}
 {"op":"update","id":"x","text":"..."}
 {"op":"upsert","id":"x","text":"..."}
@@ -176,9 +197,11 @@ Responses always carry `ok`: `{"ok":true,"results":[{"id","score"}]}` or
 `{"ok":false,"error":"..."}`. `bulk` embeds the whole batch in one inference
 (the fast path for bulk indexing) and answers
 `{"ok":true,"inserted_count":N,"updated_count":M}`; `info` answers
-`{"ok":true,"model_id":"...","dim":384,"count":N,"index":"flat|hnsw"}` so clients
-can verify the backend (e.g. reject the non-semantic mock build, or confirm the
-index type) before indexing; `compact` reclaims rows tombstoned by `remove`.
+`{"ok":true,"model_id":"...","dim":384,"count":N,"index":"flat|hnsw","hybrid":bool}`
+so clients can verify the backend (e.g. reject the non-semantic mock build, or
+confirm the index type) before indexing; `compact` reclaims rows tombstoned by
+`remove`. Adding `"hybrid":true` to a `query` on a hybrid store fuses vector and
+BM25 results (`text` only — a precomputed `vector` can't be tokenized).
 
 ## TypeScript usage
 
