@@ -103,6 +103,33 @@ reclaims them (and rebuilds the HNSW graph over the survivors). The lexical inde
 tracks the same mutations. Persistence writes each file atomically (temp +
 rename) so a crash mid-save can't corrupt an existing store.
 
+### Building the `onnx` feature behind a proxy
+
+`ort` fetches a prebuilt ONNX Runtime from `cdn.pyke.io` during its build
+script. On a network where that host is unreachable the build fails with
+`Failed to GET https://cdn.pyke.io/...` before compiling anything.
+
+Point it at a runtime you fetch yourself instead — Microsoft publishes the
+same builds on GitHub Releases:
+
+```bash
+curl -fL -o ort.tgz \
+  https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/onnxruntime-linux-x64-1.22.0.tgz
+tar xzf ort.tgz
+export ORT_LIB_LOCATION="$PWD/onnxruntime-linux-x64-1.22.0"
+cargo build --features onnx
+```
+
+Match the ONNX Runtime version to what the pinned `ort` expects (2.0.0-rc.10
+wants 1.22.x); a mismatch fails at link time rather than silently.
+
+This only covers the runtime. The `onnx` feature also needs the model
+weights, which `scripts/fetch-model.sh` pulls from Hugging Face — see
+[Bundling the model](#bundling-the-model). Without them the build still
+succeeds (build.rs writes empty placeholders) and fails at
+session-build time, so a clean build plus a runtime error pointing at the
+model is the expected state when only the weights are missing.
+
 ## Footprint
 
 - Default (mock) release binary: **~1.1 MB**, tiny dependency tree.
