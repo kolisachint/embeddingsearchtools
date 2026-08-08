@@ -84,6 +84,17 @@ graph, are rebuilt on load. Fusion cost is dominated by the vector search — th
 lexical side is a cheap postings walk — so a hybrid query costs about the same as
 a vector query plus a small constant.
 
+**Retrieving the legs separately.** `--hybrid` fuses inside the engine and
+returns one blended ranking, which is convenient but lossy: the per-retriever
+ranks and scores are gone and the RRF constant is not the caller's to choose.
+A caller doing its own fusion — n-way with a third retriever, a different
+constant, or wanting per-source diagnostics — can ask for the keyword leg on
+its own with `query --lexical` (CLI) or `"retriever":"lexical"` (daemon).
+Scores are then raw BM25 sums rather than RRF scores, and no embedding is
+computed, so it is just a postings walk. Documents sharing no query term are
+not returned, so a lexical query may yield fewer than `k` hits rather than
+padding with noise.
+
 ### Efficient updates
 
 Both backends support `add` / `update` / `upsert` / `remove` without a full
@@ -171,6 +182,8 @@ embsearch query --path ./store "..." -k 5 --json
 # Hybrid: build with a BM25 keyword index, then fuse vector + keyword results
 embsearch index --path ./hstore --hybrid --input docs.jsonl
 embsearch query --path ./hstore --hybrid "kubernetes ingress" -k 5
+# ...or take the keyword leg alone (raw BM25 scores), to fuse it yourself
+embsearch query --path ./hstore --lexical "kubernetes ingress" -k 5
 
 # Single-record mutations
 embsearch add    --path ./store --id doc42 --text "some text"
@@ -183,7 +196,8 @@ embsearch serve  --path ./store
 
 Flags: `--metric cosine|dot|euclidean`, `--index flat|hnsw`, and `--hybrid` (all
 fixed when a store is created; an existing store keeps its own — `--hybrid` also
-selects fused ranking at query time), `--model <dir>` (override bundled weights
+selects fused ranking at query time), `--lexical` (query only: keyword-only BM25
+ranking; errors on a non-hybrid store rather than silently downgrading), `--model <dir>` (override bundled weights
 with an on-disk `model.onnx` + `tokenizer.json`, onnx build only).
 
 ## Daemon protocol (NDJSON)
@@ -197,7 +211,9 @@ Requests:
 ```json
 {"op":"query","text":"...","k":5}
 {"op":"query","vector":[/* dim floats */],"k":5}
-{"op":"query","text":"...","k":5,"hybrid":true}
+{"op":"query","text":"...","k":5,"retriever":"dense"}
+{"op":"query","text":"...","k":5,"retriever":"lexical"}
+{"op":"query","text":"...","k":5,"retriever":"hybrid"}
 {"op":"add","id":"x","text":"..."}
 {"op":"update","id":"x","text":"..."}
 {"op":"upsert","id":"x","text":"..."}

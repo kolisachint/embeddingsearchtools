@@ -70,6 +70,11 @@ enum Command {
         /// Number of results.
         #[arg(short, long, default_value_t = 5)]
         k: usize,
+        /// Keyword-only BM25 ranking, with no vector search and no fusion.
+        /// Requires a hybrid store. Scores are raw BM25 sums rather than the
+        /// RRF scores `--hybrid` returns.
+        #[arg(long)]
+        lexical: bool,
         /// Emit JSON instead of a table.
         #[arg(long)]
         json: bool,
@@ -153,13 +158,23 @@ fn run() -> embsearch_core::Result<()> {
             store,
             text,
             k,
+            lexical,
             json,
         } => {
             let db = open_db(&store)?;
+            if lexical && !db.is_hybrid() {
+                return Err(embsearch_core::Error::Config(
+                    "--lexical requires a hybrid store (create it with --hybrid)".into(),
+                ));
+            }
             // `--hybrid` (from StoreArgs) selects fused vector+BM25 ranking; on a
             // non-hybrid store it is ignored (open_db already warned) and we fall
-            // back to a plain vector query.
-            let hits = if store.hybrid && db.is_hybrid() {
+            // back to a plain vector query. `--lexical` is the keyword-only leg,
+            // and unlike --hybrid it is an error rather than a silent downgrade,
+            // since there is no sensible fallback for "BM25 only".
+            let hits = if lexical {
+                db.query_lexical(&text, k)?
+            } else if store.hybrid && db.is_hybrid() {
                 db.query_hybrid(&text, k)?
             } else {
                 db.query(&text, k)?
