@@ -129,12 +129,37 @@ weights, which `scripts/fetch-model.sh` pulls from Hugging Face — see
 succeeds (build.rs writes empty placeholders) and fails at
 session-build time, so a clean build plus a runtime error pointing at the
 model is the expected state when only the weights are missing.
+### Cross-encoder reranking
+
+Retrieval and ranking are different problems. A bi-encoder embeds query and
+passage separately, so their vectors never see each other; a cross-encoder
+runs the pair through one model together, letting every query token attend to
+every passage token. That is more informative and far more expensive — it
+cannot be precomputed or indexed — so it only pays over a shortlist something
+cheaper already produced.
+
+`{"op":"rerank","query":"...","passages":[{"id","text"}],"k":10}` scores the
+pairs with a bundled `ms-marco-MiniLM-L-6-v2` and returns the best `k`, best
+first, as `reranked: [{id, score}]`. Scores are raw logits: higher is more
+relevant, but they are not probabilities and are comparable only within one
+call.
+
+Passages are supplied inline rather than looked up by id. The caller has the
+exact spans it intends to show, and those are what should be scored — the
+stored chunk text may be a different span, and a non-hybrid store keeps no
+texts at all.
+
+Requires an `onnx` build; the default (mock) build returns an error rather
+than ranking on something that is not a cross-encoder. Reranker weights add
+roughly 23 MB to the binary on top of the embedder's, so an `onnx` build is
+now ~60-70 MB.
 
 ## Footprint
 
 - Default (mock) release binary: **~1.1 MB**, tiny dependency tree.
 - With `--features onnx` + bundled int8 MiniLM: **~35–45 MB total** (≈23 MB model
-  + ≈10–15 MB ONNX Runtime + binary). *Note:* the original 10–15 MB target is only
+  + ≈10–15 MB ONNX Runtime + binary), plus ≈23 MB when the cross-encoder
+  reranker weights are bundled alongside. *Note:* the original 10–15 MB target is only
   reachable with static-embedding models; MiniLM was chosen for accuracy, which
   moves the realistic budget to ~40 MB.
 
