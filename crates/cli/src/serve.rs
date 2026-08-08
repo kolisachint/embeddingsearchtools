@@ -21,7 +21,8 @@
 //! - `{"op":"save"}`                             → persist to the store dir
 //! - `{"op":"compact"}`                          → reclaim tombstoned rows
 //! - `{"op":"count"}`                            → live vector count
-//! - `{"op":"info"}`                             → model id, dim, count
+//! - `{"op":"info"}`                             → model id, dim, count,
+//!   and `rerank`: whether this binary can actually serve the `rerank` op
 //! - `{"op":"rerank","query":"...","passages":[...],"k":10}` → cross-encoder
 //!   reranking of caller-supplied passages
 //! - `{"op":"ping"}`                             → readiness probe
@@ -35,6 +36,7 @@ use embsearch_core::{Database, Embedder, SearchResult};
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 /// Which retriever answers a `query`.
 ///
@@ -157,6 +159,14 @@ struct OkResponse {
     index: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     hybrid: Option<bool>,
+    /// Whether `rerank` will actually work on this binary.
+    ///
+    /// Reported on `info` because the daemon's version no longer implies it:
+    /// released binaries carry the `rerank` op but not the weights, so a
+    /// caller that gated on version alone would offer a reranker that errors
+    /// on first use. Only ever `Some` on `info`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rerank: Option<bool>,
     /// Reranked ids with their cross-encoder logits. Distinct from `results`
     /// because the scores are not comparable to retrieval scores.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -177,6 +187,7 @@ impl OkResponse {
             dim: None,
             index: None,
             hybrid: None,
+            rerank: None,
             reranked: None,
         }
     }
@@ -195,18 +206,46 @@ impl Response {
 ///
 /// `store_dir` is where `save` writes. Reads from `input`, writes to `output`
 /// (parameterized so the loop is unit-testable without real pipes).
+/// Where to load cross-encoder weights from, when they are not bundled.
+///
+/// Set once from `--reranker-model` before the daemon loop starts; read on
+/// first `rerank`. A `OnceLock` rather than a parameter because the encoder
+/// itself is process-wide and lazily built, and threading a path through every
+/// request would say the model can change per request, which it cannot.
+static RERANKER_MODEL_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+/// Record the `--reranker-model` directory. Call before [`run`]; later calls
+/// are ignored, since the encoder is built once and kept hot.
+pub fn set_reranker_model_dir(dir: Option<PathBuf>) {
+    let _ = RERANKER_MODEL_DIR.set(dir);
+}
+
 /// The process-wide cross-encoder, built on first use.
 ///
 /// Loading the model costs a second or so, so it is built once and kept hot
-/// for the daemon's lifetime — the same reason `serve` exists at all. A
-/// default (mock) build has no reranker weights, and says so rather than
-/// scoring with something that is not a cross-encoder.
+/// for the daemon's lifetime — the same reason `serve` exists at all.
+///
+/// Released binaries bundle the embedder but **not** a reranker: it is a
+/// second ~23 MB model, and bundling it tripled the download for a reranker
+/// that measured worse than a caller's own deterministic scorer on every query
+/// class but one. So the usual path here is `--reranker-model <dir>`; a build
+/// that ran `scripts/fetch-model.sh --with-reranker` still works with no flag.
+/// A build with neither says so, rather than scoring with something that is
+/// not a cross-encoder.
 #[cfg(feature = "onnx")]
 fn cross_encoder() -> std::result::Result<&'static dyn CrossEncoder, String> {
     use embsearch_core::rerank::MiniLmCrossEncoder;
-    use std::sync::OnceLock;
     static ENCODER: OnceLock<std::result::Result<MiniLmCrossEncoder, String>> = OnceLock::new();
-    match ENCODER.get_or_init(|| MiniLmCrossEncoder::from_bundled().map_err(|e| e.to_string())) {
+    let built = ENCODER.get_or_init(|| {
+        match RERANKER_MODEL_DIR.get().and_then(|d| d.as_ref()) {
+            Some(dir) => MiniLmCrossEncoder::from_dir(dir)
+                .map_err(|e| format!("--reranker-model {}: {e}", dir.display())),
+            // Falls back to bundled weights, which are an empty placeholder
+            // unless this binary was built with --with-reranker.
+            None => MiniLmCrossEncoder::from_bundled().map_err(|e| e.to_string()),
+        }
+    });
+    match built {
         Ok(encoder) => Ok(encoder),
         Err(e) => Err(e.clone()),
     }
@@ -261,6 +300,13 @@ fn handle<E: Embedder>(
                     text: p.text,
                 })
                 .collect();
+            // Nothing to score is a valid question with an empty answer, and
+            // answering it must not depend on whether this binary has weights.
+            if candidates.is_empty() {
+                let mut r = OkResponse::empty();
+                r.reranked = Some(vec![]);
+                return Response::Ok(r);
+            }
             match cross_encoder() {
                 Err(e) => Response::error(e),
                 Ok(encoder) => match rerank_candidates(encoder, &query, &candidates, k) {
@@ -369,6 +415,10 @@ fn handle<E: Embedder>(
             r.count = Some(db.len());
             r.index = Some(db.index_kind().to_string());
             r.hybrid = Some(db.is_hybrid());
+            // Builds the encoder if it is not built yet — the one place where
+            // paying that cost up front is right, since the answer is the
+            // question being asked.
+            r.rerank = Some(cross_encoder().is_ok());
             Response::Ok(r)
         }
         Request::Save => match store_dir {
@@ -458,6 +508,18 @@ mod tests {
         assert_eq!(out[1]["model_id"], "mock-hash-v1");
         assert_eq!(out[1]["dim"], 32);
         assert_eq!(out[1]["count"], 1);
+    }
+
+    #[test]
+    fn info_reports_whether_rerank_is_actually_available() {
+        // A mock build has no cross-encoder, so `info` must say so. Callers
+        // gate on this rather than on the daemon version: released onnx
+        // binaries carry the `rerank` op but not the weights, and a caller
+        // that assumed version implied capability would offer a reranker that
+        // errors on first use.
+        let out = drive(&[r#"{"op":"info"}"#]);
+        assert_eq!(out[0]["ok"], true);
+        assert_eq!(out[0]["rerank"], false);
     }
 
     #[test]
@@ -620,7 +682,12 @@ mod tests {
         ]);
         assert_eq!(out[0]["ok"], false);
         let err = out[0]["error"].as_str().unwrap();
-        assert!(err.contains("onnx"), "unhelpful error: {err}");
+        // Two builds refuse for two reasons — no onnx feature at all, or the
+        // feature without bundled weights — and each names its own remedy.
+        assert!(
+            err.contains("onnx") || err.contains("--reranker-model"),
+            "error should say how to get a reranker: {err}"
+        );
     }
 
     #[test]
@@ -637,9 +704,10 @@ mod tests {
     #[test]
     fn rerank_accepts_an_empty_passage_list() {
         // Nothing to score is a valid question with an empty answer, and must
-        // not depend on whether a reranker exists.
+        // not depend on whether a reranker exists — so this passes on a mock
+        // build, an onnx build with weights, and an onnx build without.
         let out = drive(&[r#"{"op":"rerank","query":"q","passages":[],"k":5}"#]);
-        assert_eq!(out[0]["ok"], false);
-        assert!(out[0]["error"].as_str().unwrap().contains("onnx"));
+        assert_eq!(out[0]["ok"], true);
+        assert_eq!(out[0]["reranked"], serde_json::json!([]));
     }
 }

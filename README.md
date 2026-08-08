@@ -113,29 +113,43 @@ cannot be precomputed or indexed — so it only pays over a shortlist something
 cheaper already produced.
 
 `{"op":"rerank","query":"...","passages":[{"id","text"}],"k":10}` scores the
-pairs with a bundled `ms-marco-MiniLM-L-6-v2` and returns the best `k`, best
-first, as `reranked: [{id, score}]`. Scores are raw logits: higher is more
-relevant, but they are not probabilities and are comparable only within one
-call.
+pairs with `ms-marco-MiniLM-L-6-v2` and returns the best `k`, best first, as
+`reranked: [{id, score}]`. Scores are raw logits: higher is more relevant, but
+they are not probabilities and are comparable only within one call.
 
 Passages are supplied inline rather than looked up by id. The caller has the
 exact spans it intends to show, and those are what should be scored — the
 stored chunk text may be a different span, and a non-hybrid store keeps no
 texts at all.
 
-Requires an `onnx` build; the default (mock) build returns an error rather
-than ranking on something that is not a cross-encoder. Reranker weights add
-roughly 23 MB to the binary on top of the embedder's, so an `onnx` build is
-now ~60-70 MB.
+**Released binaries do not carry the reranker.** It is a second ~23 MB model
+on top of the embedder's, and bundling it took the extracted binary from 26 MB
+to 73 MB. That price bought a reranker which, measured against a caller's own
+deterministic lexical scorer over a 62-query code-retrieval set, was
+significantly *worse* on Recall@1 in every configuration (p ≤ 0.05) and lost
+on every query class but conceptual — a passage ranker trained on
+natural-language queries is out of distribution on an identifier, an error
+string or a filename. So the default release ships lean and `rerank` returns
+an error naming the two ways to enable it:
+
+- `scripts/fetch-model.sh --with-reranker` then `cargo build --features onnx`,
+  which bundles the weights as before; or
+- `embsearch serve --reranker-model <dir>`, pointing at a directory holding
+  `model.onnx` + `tokenizer.json`, which needs no rebuild.
+
+Either way it requires an `onnx` build; the default (mock) build returns an
+error rather than ranking on something that is not a cross-encoder.
 
 ## Footprint
 
 - Default (mock) release binary: **~1.1 MB**, tiny dependency tree.
 - With `--features onnx` + bundled int8 MiniLM: **~35–45 MB total** (≈23 MB model
-  + ≈10–15 MB ONNX Runtime + binary), plus ≈23 MB when the cross-encoder
-  reranker weights are bundled alongside. *Note:* the original 10–15 MB target is only
+  + ≈10–15 MB ONNX Runtime + binary). *Note:* the original 10–15 MB target is only
   reachable with static-embedding models; MiniLM was chosen for accuracy, which
   moves the realistic budget to ~40 MB.
+- Adding the cross-encoder reranker weights (`fetch-model.sh --with-reranker`)
+  roughly doubles that again. Released binaries do not include them — see
+  [Cross-encoder reranking](#cross-encoder-reranking).
 
 ## Performance
 
