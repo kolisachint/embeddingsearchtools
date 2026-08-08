@@ -297,11 +297,16 @@ Responses always carry `ok`: `{"ok":true,"results":[{"id","score"}]}` or
 `{"ok":false,"error":"..."}`. `bulk` embeds the whole batch in one inference
 (the fast path for bulk indexing) and answers
 `{"ok":true,"inserted_count":N,"updated_count":M}`; `info` answers
-`{"ok":true,"model_id":"...","dim":384,"count":N,"index":"flat|hnsw","hybrid":bool}`
+`{"ok":true,"model_id":"...","dim":384,"count":N,"index":"flat|hnsw","hybrid":bool,"rerank":bool}`
 so clients can verify the backend (e.g. reject the non-semantic mock build, or
-confirm the index type) before indexing; `compact` reclaims rows tombstoned by
-`remove`. Adding `"hybrid":true` to a `query` on a hybrid store fuses vector and
-BM25 results (`text` only — a precomputed `vector` can't be tokenized).
+confirm the index type) before indexing. Two of those fields answer questions
+the binary's version cannot: `hybrid` is fixed when a store is created, so a
+client cannot infer it from the daemon it launched, and `rerank` reports
+whether cross-encoder weights are actually loadable — released binaries carry
+the `rerank` op without bundling the weights, so a version check alone would
+advertise a reranker that fails on first call. `compact` reclaims rows
+tombstoned by `remove`. Adding `"hybrid":true` to a `query` on a hybrid store
+fuses vector and BM25 results (`text` only — a precomputed `vector` can't be tokenized).
 
 ## TypeScript usage
 
