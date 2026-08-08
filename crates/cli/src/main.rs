@@ -83,6 +83,17 @@ enum Command {
     Serve {
         #[command(flatten)]
         store: StoreArgs,
+        /// Directory holding cross-encoder weights (`model.onnx` +
+        /// `tokenizer.json`) for the `rerank` op.
+        ///
+        /// Released binaries do not bundle a reranker — it is a second ~23 MB
+        /// model, and bundling it tripled the download. Point this at a
+        /// `scripts/fetch-model.sh --with-reranker` checkout to enable `rerank`
+        /// without rebuilding. Without it, `rerank` returns an error naming
+        /// this flag rather than scoring with something that is not a
+        /// cross-encoder.
+        #[arg(long)]
+        reranker_model: Option<PathBuf>,
     },
 }
 
@@ -190,8 +201,12 @@ fn run() -> embsearch_core::Result<()> {
             }
             Ok(())
         }
-        Command::Serve { store } => {
+        Command::Serve {
+            store,
+            reranker_model,
+        } => {
             let db = open_db(&store)?;
+            serve::set_reranker_model_dir(reranker_model);
             eprintln!(
                 "embsearch daemon ready: {} vectors, model '{}', dim {}, {} index{}",
                 db.len(),

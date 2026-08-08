@@ -119,8 +119,9 @@ mod onnx {
         fn from_bytes(model: &[u8], tokenizer_json: &[u8]) -> Result<Self> {
             if model.is_empty() {
                 return Err(Error::embed(
-                    "no reranker weights bundled; run scripts/fetch-model.sh before building \
-                     with --features onnx, or pass --reranker-model <dir>",
+                    "no reranker weights bundled (released binaries ship without them); \
+                     start the daemon with --reranker-model <dir>, or rebuild after \
+                     scripts/fetch-model.sh --with-reranker",
                 ));
             }
             let session = Session::builder()
