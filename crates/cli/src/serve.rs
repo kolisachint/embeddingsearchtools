@@ -22,12 +22,15 @@
 //! - `{"op":"compact"}`                          → reclaim tombstoned rows
 //! - `{"op":"count"}`                            → live vector count
 //! - `{"op":"info"}`                             → model id, dim, count
+//! - `{"op":"rerank","query":"...","passages":[...],"k":10}` → cross-encoder
+//!   reranking of caller-supplied passages
 //! - `{"op":"ping"}`                             → readiness probe
 //!
 //! Responses always carry `ok`:
 //! - `{"ok":true, ...}` with op-specific fields (`results`, `inserted`, ...)
 //! - `{"ok":false,"error":"message"}`
 
+use embsearch_core::rerank::{rerank_candidates, CrossEncoder, RerankCandidate, RerankResult};
 use embsearch_core::{Database, Embedder, SearchResult};
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Write};
@@ -50,6 +53,13 @@ enum Retriever {
     Hybrid,
 }
 
+/// One candidate to score, as sent by the caller.
+#[derive(Debug, Deserialize)]
+struct RerankPassage {
+    id: String,
+    text: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "lowercase")]
 enum Request {
@@ -69,6 +79,18 @@ enum Request {
         /// disagree.
         #[serde(default)]
         hybrid: bool,
+    },
+    /// Score `(query, passage)` pairs with the bundled cross-encoder and
+    /// return the best `k`. Passages are supplied inline rather than looked up
+    /// by id: the caller has the exact spans it intends to show, which is what
+    /// should be scored, and this works against any store — including a
+    /// non-hybrid one that keeps no texts at all.
+    Rerank {
+        query: String,
+        #[serde(default)]
+        passages: Vec<RerankPassage>,
+        #[serde(default = "default_k")]
+        k: usize,
     },
     Add {
         id: String,
@@ -135,6 +157,10 @@ struct OkResponse {
     index: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     hybrid: Option<bool>,
+    /// Reranked ids with their cross-encoder logits. Distinct from `results`
+    /// because the scores are not comparable to retrieval scores.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reranked: Option<Vec<RerankResult>>,
 }
 
 impl OkResponse {
@@ -151,6 +177,7 @@ impl OkResponse {
             dim: None,
             index: None,
             hybrid: None,
+            reranked: None,
         }
     }
 }
@@ -168,6 +195,28 @@ impl Response {
 ///
 /// `store_dir` is where `save` writes. Reads from `input`, writes to `output`
 /// (parameterized so the loop is unit-testable without real pipes).
+/// The process-wide cross-encoder, built on first use.
+///
+/// Loading the model costs a second or so, so it is built once and kept hot
+/// for the daemon's lifetime — the same reason `serve` exists at all. A
+/// default (mock) build has no reranker weights, and says so rather than
+/// scoring with something that is not a cross-encoder.
+#[cfg(feature = "onnx")]
+fn cross_encoder() -> std::result::Result<&'static dyn CrossEncoder, String> {
+    use embsearch_core::rerank::MiniLmCrossEncoder;
+    use std::sync::OnceLock;
+    static ENCODER: OnceLock<std::result::Result<MiniLmCrossEncoder, String>> = OnceLock::new();
+    match ENCODER.get_or_init(|| MiniLmCrossEncoder::from_bundled().map_err(|e| e.to_string())) {
+        Ok(encoder) => Ok(encoder),
+        Err(e) => Err(e.clone()),
+    }
+}
+
+#[cfg(not(feature = "onnx"))]
+fn cross_encoder() -> std::result::Result<&'static dyn CrossEncoder, String> {
+    Err("rerank requires an onnx build; this binary has no cross-encoder".into())
+}
+
 pub fn run<E, R, W>(
     mut db: Database<E>,
     store_dir: Option<PathBuf>,
@@ -204,6 +253,26 @@ fn handle<E: Embedder>(
 ) -> Response {
     match req {
         Request::Ping => Response::Ok(OkResponse::empty()),
+        Request::Rerank { query, passages, k } => {
+            let candidates: Vec<RerankCandidate> = passages
+                .into_iter()
+                .map(|p| RerankCandidate {
+                    id: p.id,
+                    text: p.text,
+                })
+                .collect();
+            match cross_encoder() {
+                Err(e) => Response::error(e),
+                Ok(encoder) => match rerank_candidates(encoder, &query, &candidates, k) {
+                    Ok(reranked) => {
+                        let mut r = OkResponse::empty();
+                        r.reranked = Some(reranked);
+                        Response::Ok(r)
+                    }
+                    Err(e) => Response::error(e),
+                },
+            }
+        }
         Request::Count => {
             let mut r = OkResponse::empty();
             r.count = Some(db.len());
@@ -539,5 +608,38 @@ mod tests {
     fn unknown_retriever_is_rejected() {
         let out = drive_hybrid(&[r#"{"op":"query","text":"x","k":1,"retriever":"bogus"}"#]);
         assert_eq!(out[0]["ok"], false);
+    }
+
+    #[test]
+    fn rerank_on_a_mock_build_refuses_rather_than_scoring() {
+        // The default build has no cross-encoder. Answering anyway — with
+        // cosine, or with the input order — would look like a working reranker
+        // while ranking on something else entirely.
+        let out = drive(&[
+            r#"{"op":"rerank","query":"quick fox","passages":[{"id":"a","text":"quick brown fox"}],"k":5}"#,
+        ]);
+        assert_eq!(out[0]["ok"], false);
+        let err = out[0]["error"].as_str().unwrap();
+        assert!(err.contains("onnx"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn rerank_validates_its_request_shape() {
+        // Missing `query` is a malformed request, not an empty one.
+        let out = drive(&[r#"{"op":"rerank","passages":[],"k":5}"#]);
+        assert_eq!(out[0]["ok"], false);
+        assert!(out[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("invalid request"));
+    }
+
+    #[test]
+    fn rerank_accepts_an_empty_passage_list() {
+        // Nothing to score is a valid question with an empty answer, and must
+        // not depend on whether a reranker exists.
+        let out = drive(&[r#"{"op":"rerank","query":"q","passages":[],"k":5}"#]);
+        assert_eq!(out[0]["ok"], false);
+        assert!(out[0]["error"].as_str().unwrap().contains("onnx"));
     }
 }
