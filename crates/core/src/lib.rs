@@ -387,6 +387,41 @@ impl<E: Embedder> Database<E> {
         Ok(rrf_fuse(&dense, &lexical, k))
     }
 
+    /// Keyword-only top-`k`: BM25 over the lexical index, with no vector search
+    /// and no fusion. Errors if the store is not hybrid.
+    ///
+    /// Unlike [`query_hybrid`](Database::query_hybrid), the returned `score` is
+    /// the raw BM25 sum, so it is comparable *between hits of this call* and
+    /// carries the retriever's own notion of strength. It is still not
+    /// comparable to a cosine score, which is why fusing the two by rank rather
+    /// than by score remains the right default.
+    ///
+    /// This exists so a caller can fuse the two retrievers itself. `query_hybrid`
+    /// applies this crate's RRF with its own constant and returns a single
+    /// blended list, which is convenient but lossy: the per-retriever ranks and
+    /// scores are gone, and `k` is not the caller's to choose. A caller wanting
+    /// n-way fusion (say BM25 + dense + its own third retriever), a different
+    /// fusion constant, or per-source diagnostics needs the legs separately.
+    ///
+    /// No embedding is computed, so this is cheap — a postings walk.
+    pub fn query_lexical(&self, query: &str, k: usize) -> Result<Vec<SearchResult>> {
+        let Some(h) = &self.hybrid else {
+            return Err(Error::Config(
+                "query_lexical requires a hybrid store; create it with new_hybrid / \
+                 open_or_create_hybrid (or the CLI --hybrid flag)"
+                    .into(),
+            ));
+        };
+        if k == 0 {
+            return Ok(vec![]);
+        }
+        Ok(h.lexical
+            .search(query, k)
+            .into_iter()
+            .map(|(id, score)| SearchResult { id, score })
+            .collect())
+    }
+
     /// Number of live vectors.
     pub fn len(&self) -> usize {
         self.index.len()
@@ -721,6 +756,95 @@ mod tests {
         let db = Database::new(MockEmbedder::new(64), Metric::Cosine);
         assert!(!db.is_hybrid());
         assert!(matches!(db.query_hybrid("x", 5), Err(Error::Config(_))));
+    }
+
+    #[test]
+    fn query_lexical_requires_hybrid_store() {
+        let db = Database::new(MockEmbedder::new(64), Metric::Cosine);
+        assert!(!db.is_hybrid());
+        assert!(matches!(db.query_lexical("x", 5), Err(Error::Config(_))));
+    }
+
+    #[test]
+    fn query_lexical_ranks_by_bm25_without_touching_the_vector_index() {
+        let mut db = Database::new_hybrid(MockEmbedder::new(256), Metric::Cosine, IndexKind::Flat);
+        db.add("d1", "the quick brown fox jumps over the lazy dog")
+            .unwrap();
+        db.add("d2", "rust systems programming language performance")
+            .unwrap();
+        db.add("d3", "a fast auburn fox leaps above a sleepy hound")
+            .unwrap();
+
+        let hits = db.query_lexical("quick fox", 5).unwrap();
+        // Only documents sharing a query term come back — no top-k padding with
+        // unrelated documents, which is what makes this usable as a fusion leg.
+        let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["d1", "d3"],
+            "d2 shares no term and must not appear"
+        );
+        assert!(hits[0].score > hits[1].score, "d1 matches both terms");
+        // Raw BM25 sums, not RRF scores: RRF with k=60 tops out around 1/61.
+        assert!(
+            hits[0].score > 0.5,
+            "expected a BM25 score, got {}",
+            hits[0].score
+        );
+    }
+
+    #[test]
+    fn query_lexical_returns_scores_hybrid_fusion_discards() {
+        let mut db = Database::new_hybrid(MockEmbedder::new(256), Metric::Cosine, IndexKind::Flat);
+        // A term is only discriminative when most documents lack it: BM25's IDF
+        // goes to zero once every document matches.
+        db.add("d1", "the quick brown fox").unwrap();
+        db.add("d2", "rust systems programming").unwrap();
+        db.add("d3", "postgres replication lag").unwrap();
+        db.add("d4", "kubernetes ingress routing").unwrap();
+
+        let lexical = db.query_lexical("quick fox", 5).unwrap();
+        let fused = db.query_hybrid("quick fox", 5).unwrap();
+
+        // The whole point of the separate leg: hybrid collapses both retrievers
+        // into one RRF score, so a caller cannot recover BM25 strength from it.
+        // RRF with k = 60 caps every score near 1/61, whatever BM25 said.
+        assert_eq!(lexical.len(), 1, "only d1 shares a query term");
+        assert!(
+            lexical[0].score > 1.0,
+            "raw BM25 sum, got {}",
+            lexical[0].score
+        );
+        assert!(
+            fused.iter().all(|h| h.score < 0.1),
+            "fused scores are RRF, not BM25"
+        );
+    }
+
+    #[test]
+    fn query_lexical_honors_k_and_empty_k() {
+        let mut db = Database::new_hybrid(MockEmbedder::new(256), Metric::Cosine, IndexKind::Flat);
+        db.add("d1", "alpha beta").unwrap();
+        db.add("d2", "alpha gamma").unwrap();
+        db.add("d3", "alpha delta").unwrap();
+        assert_eq!(db.query_lexical("alpha", 2).unwrap().len(), 2);
+        assert!(db.query_lexical("alpha", 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn query_lexical_reflects_removals() {
+        let mut db = Database::new_hybrid(MockEmbedder::new(256), Metric::Cosine, IndexKind::Flat);
+        db.add("d1", "shared term here").unwrap();
+        db.add("d2", "shared term there").unwrap();
+        assert_eq!(db.query_lexical("shared", 5).unwrap().len(), 2);
+        assert!(db.remove("d1").unwrap());
+        let ids: Vec<String> = db
+            .query_lexical("shared", 5)
+            .unwrap()
+            .into_iter()
+            .map(|h| h.id)
+            .collect();
+        assert_eq!(ids, vec!["d2"]);
     }
 
     #[test]

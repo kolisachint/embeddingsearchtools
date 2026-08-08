@@ -8,7 +8,8 @@
 //! Protocol — one JSON object per line.
 //!
 //! Requests (`op` selects the operation):
-//! - `{"op":"query","text":"...","k":5}`        → search
+//! - `{"op":"query","text":"...","k":5}`        → search (dense)
+//! - `{"op":"query","text":"...","k":5,"retriever":"lexical"}` → BM25 only
 //! - `{"op":"query","vector":[...],"k":5}`       → search a precomputed vector
 //!   (`text` and `vector` are mutually exclusive; sending both is an error)
 //! - `{"op":"add","id":"x","text":"..."}`        → insert
@@ -32,6 +33,23 @@ use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 
+/// Which retriever answers a `query`.
+///
+/// `Lexical` exists so a caller can fuse the retrievers itself: `Hybrid`
+/// applies this crate's RRF with its own constant and returns one blended
+/// list, discarding the per-retriever ranks and scores a caller needs for
+/// n-way fusion, a different constant, or diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Retriever {
+    /// Vector search over the embedding index.
+    Dense,
+    /// BM25 over the lexical index. Requires a hybrid store.
+    Lexical,
+    /// Both, fused by this crate's RRF. Requires a hybrid store.
+    Hybrid,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "lowercase")]
 enum Request {
@@ -42,7 +60,13 @@ enum Request {
         vector: Option<Vec<f32>>,
         #[serde(default = "default_k")]
         k: usize,
-        /// Fuse vector + BM25 results (requires a hybrid store and `text`).
+        /// Which retriever answers: `dense` (default), `lexical`, or `hybrid`.
+        /// `lexical` and `hybrid` need a hybrid store and `text`.
+        #[serde(default)]
+        retriever: Option<Retriever>,
+        /// Deprecated alias for `"retriever":"hybrid"`, kept so existing
+        /// callers keep working. Setting both is only an error when they
+        /// disagree.
         #[serde(default)]
         hybrid: bool,
     },
@@ -189,17 +213,32 @@ fn handle<E: Embedder>(
             text,
             vector,
             k,
+            retriever,
             hybrid,
         } => {
-            if hybrid && vector.is_some() {
-                return Response::error("hybrid query requires `text`, not `vector`");
+            // `hybrid: true` is the old spelling of `retriever: "hybrid"`.
+            // Accept either, and reject only a genuine contradiction rather
+            // than silently picking one.
+            let retriever = match (retriever, hybrid) {
+                (Some(r), true) if r != Retriever::Hybrid => {
+                    return Response::error("`hybrid: true` contradicts the given `retriever`");
+                }
+                (Some(r), _) => r,
+                (None, true) => Retriever::Hybrid,
+                (None, false) => Retriever::Dense,
+            };
+            if retriever != Retriever::Dense && vector.is_some() {
+                return Response::error("lexical and hybrid queries require `text`, not `vector`");
             }
             let result = match (text, vector) {
                 (Some(_), Some(_)) => {
                     return Response::error("query accepts text or vector, not both");
                 }
-                (Some(t), None) if hybrid => db.query_hybrid(&t, k),
-                (Some(t), None) => db.query(&t, k),
+                (Some(t), None) => match retriever {
+                    Retriever::Dense => db.query(&t, k),
+                    Retriever::Lexical => db.query_lexical(&t, k),
+                    Retriever::Hybrid => db.query_hybrid(&t, k),
+                },
                 (None, Some(v)) => db.query_vector(&v, k),
                 (None, None) => {
                     return Response::error("query requires `text` or `vector`");
@@ -276,10 +315,24 @@ fn handle<E: Embedder>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use embsearch_core::{Metric, MockEmbedder};
+    use embsearch_core::{IndexKind, Metric, MockEmbedder};
 
     fn drive(requests: &[&str]) -> Vec<serde_json::Value> {
-        let db = Database::new(MockEmbedder::new(32), Metric::Cosine);
+        drive_db(
+            Database::new(MockEmbedder::new(32), Metric::Cosine),
+            requests,
+        )
+    }
+
+    /// Same, against a hybrid (vector + BM25) store.
+    fn drive_hybrid(requests: &[&str]) -> Vec<serde_json::Value> {
+        drive_db(
+            Database::new_hybrid(MockEmbedder::new(32), Metric::Cosine, IndexKind::Flat),
+            requests,
+        )
+    }
+
+    fn drive_db(db: Database<MockEmbedder>, requests: &[&str]) -> Vec<serde_json::Value> {
         let input = requests.join("\n");
         let mut out: Vec<u8> = Vec::new();
         run(db, None, std::io::Cursor::new(input), &mut out).unwrap();
@@ -403,5 +456,88 @@ mod tests {
         assert_eq!(out[3]["ok"], false);
         // Validation failed the whole batch before anything was applied.
         assert_eq!(out[4]["count"], 0);
+    }
+
+    #[test]
+    fn lexical_retriever_returns_bm25_only() {
+        let out = drive_hybrid(&[
+            r#"{"op":"add","id":"a","text":"the quick brown fox"}"#,
+            r#"{"op":"add","id":"b","text":"rust systems programming"}"#,
+            r#"{"op":"add","id":"c","text":"postgres replication lag"}"#,
+            r#"{"op":"query","text":"quick fox","k":5,"retriever":"lexical"}"#,
+        ]);
+        let results = out[3]["results"].as_array().unwrap();
+        // Only the document sharing query terms comes back: no top-k padding
+        // with unrelated documents, which is what makes this a usable leg.
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["id"], "a");
+        // Raw BM25, not the RRF score `hybrid` would return (~1/61).
+        assert!(results[0]["score"].as_f64().unwrap() > 1.0);
+    }
+
+    #[test]
+    fn lexical_and_dense_legs_are_separately_retrievable() {
+        // The reason the op exists: a caller fusing the retrievers itself needs
+        // each list on its own, which `hybrid` cannot give it.
+        let out = drive_hybrid(&[
+            r#"{"op":"add","id":"a","text":"the quick brown fox"}"#,
+            r#"{"op":"add","id":"b","text":"rust systems programming"}"#,
+            r#"{"op":"query","text":"quick fox","k":5,"retriever":"lexical"}"#,
+            r#"{"op":"query","text":"quick fox","k":5,"retriever":"dense"}"#,
+            r#"{"op":"query","text":"quick fox","k":5,"retriever":"hybrid"}"#,
+        ]);
+        for (i, response) in out.iter().enumerate().skip(2) {
+            assert_eq!(response["ok"], true, "request {i} failed: {response:?}");
+        }
+        let lexical_top = out[2]["results"][0]["score"].as_f64().unwrap();
+        let fused_top = out[4]["results"][0]["score"].as_f64().unwrap();
+        assert!(lexical_top > fused_top, "BM25 sums dwarf RRF scores");
+    }
+
+    #[test]
+    fn retriever_defaults_to_dense_and_hybrid_flag_still_works() {
+        let out = drive_hybrid(&[
+            r#"{"op":"add","id":"a","text":"the quick brown fox"}"#,
+            r#"{"op":"query","text":"quick fox","k":1}"#,
+            r#"{"op":"query","text":"quick fox","k":1,"hybrid":true}"#,
+        ]);
+        assert_eq!(out[1]["ok"], true);
+        assert_eq!(out[2]["ok"], true);
+        // The deprecated flag must still select fusion, i.e. an RRF score.
+        assert!(out[2]["results"][0]["score"].as_f64().unwrap() < 0.1);
+    }
+
+    #[test]
+    fn contradicting_hybrid_flag_and_retriever_is_rejected() {
+        let out = drive_hybrid(&[
+            r#"{"op":"add","id":"a","text":"quick fox"}"#,
+            r#"{"op":"query","text":"quick fox","k":1,"hybrid":true,"retriever":"lexical"}"#,
+        ]);
+        assert_eq!(out[1]["ok"], false);
+        assert!(out[1]["error"].as_str().unwrap().contains("contradicts"));
+    }
+
+    #[test]
+    fn lexical_retriever_needs_a_hybrid_store() {
+        let out = drive(&[
+            r#"{"op":"add","id":"a","text":"quick fox"}"#,
+            r#"{"op":"query","text":"quick fox","k":1,"retriever":"lexical"}"#,
+        ]);
+        assert_eq!(out[1]["ok"], false);
+        assert!(out[1]["error"].as_str().unwrap().contains("hybrid store"));
+    }
+
+    #[test]
+    fn lexical_retriever_rejects_a_vector_query() {
+        let out =
+            drive_hybrid(&[r#"{"op":"query","vector":[0.1,0.2],"k":1,"retriever":"lexical"}"#]);
+        assert_eq!(out[0]["ok"], false);
+        assert!(out[0]["error"].as_str().unwrap().contains("`text`"));
+    }
+
+    #[test]
+    fn unknown_retriever_is_rejected() {
+        let out = drive_hybrid(&[r#"{"op":"query","text":"x","k":1,"retriever":"bogus"}"#]);
+        assert_eq!(out[0]["ok"], false);
     }
 }
