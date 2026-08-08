@@ -28,6 +28,7 @@ mod error;
 mod hnsw;
 mod index;
 mod lexical;
+pub mod rerank;
 mod simd;
 pub mod store;
 

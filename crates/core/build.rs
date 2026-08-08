@@ -23,7 +23,12 @@ fn main() {
     }
 
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
-    for name in ["models/model.onnx", "models/tokenizer.json"] {
+    for name in [
+        "models/model.onnx",
+        "models/tokenizer.json",
+        "models/reranker/model.onnx",
+        "models/reranker/tokenizer.json",
+    ] {
         let path = Path::new(&manifest_dir).join(name);
         // Re-run if the file appears/changes (e.g. after fetch-model.sh).
         println!("cargo:rerun-if-changed={}", path.display());
@@ -36,7 +41,7 @@ fn main() {
                 panic!("failed to create model placeholder {}: {e}", path.display())
             });
             println!(
-                "cargo:warning=bundling EMPTY MiniLM placeholder for {name} \
+                "cargo:warning=bundling EMPTY model placeholder for {name} \
                  — run scripts/fetch-model.sh for real weights, or use --model <dir> at runtime"
             );
         }

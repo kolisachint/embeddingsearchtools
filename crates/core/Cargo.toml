@@ -11,7 +11,12 @@ repository.workspace = true
 # `cargo` ignores git's skip-worktree, so exclude them explicitly here. build.rs
 # synthesizes empty placeholders when absent so the `onnx` feature still
 # compiles from a published crate (see build.rs).
-exclude = ["models/model.onnx", "models/tokenizer.json"]
+exclude = [
+    "models/model.onnx",
+    "models/tokenizer.json",
+    "models/reranker/model.onnx",
+    "models/reranker/tokenizer.json",
+]
 
 [lib]
 name = "embsearch_core"
