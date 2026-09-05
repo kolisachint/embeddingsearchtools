@@ -48,7 +48,8 @@ impl Error {
         Error::Corrupt(msg.to_string())
     }
 
-    #[cfg(feature = "onnx")]
+    // Not `onnx`-gated: `ModelSpec` parsing reports through it in every build,
+    // so a model.json can be validated without an inference backend.
     pub(crate) fn embed(msg: impl fmt::Display) -> Self {
         Error::Embed(msg.to_string())
     }

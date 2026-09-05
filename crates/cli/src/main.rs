@@ -7,8 +7,8 @@
 //! - `serve`  — run the long-lived NDJSON daemon (see `serve.rs`).
 //!
 //! The embedding backend is chosen at build time: the default build uses the
-//! deterministic `MockEmbedder`; building with `--features onnx` uses real
-//! `all-MiniLM-L6-v2` inference.
+//! deterministic `MockEmbedder`; building with `--features onnx` runs a real
+//! bi-encoder — the bundled one, or any model directory passed to `--model`.
 
 mod serve;
 
@@ -120,7 +120,11 @@ struct StoreArgs {
     #[arg(long)]
     hybrid: bool,
     /// Override the model directory (with `--features onnx`): a dir holding
-    /// `model.onnx` + `tokenizer.json`. Ignored by the default mock build.
+    /// `model.onnx`, `tokenizer.json` and `model.json`. The `model.json` spec
+    /// is required — it carries pooling, token limit and query/document
+    /// prefixes, none of which can be inferred from the weights, and guessing
+    /// them wrong is invisible except as worse results. Ignored by the default
+    /// mock build.
     #[arg(long)]
     model: Option<PathBuf>,
 }
@@ -322,10 +326,10 @@ fn build_embedder(_store: &StoreArgs) -> embsearch_core::Result<Box<dyn Embedder
 
 #[cfg(feature = "onnx")]
 fn build_embedder(store: &StoreArgs) -> embsearch_core::Result<Box<dyn Embedder>> {
-    use embsearch_core::MiniLmEmbedder;
+    use embsearch_core::OnnxEmbedder;
     let embedder = match &store.model {
-        Some(dir) => MiniLmEmbedder::from_dir(dir)?,
-        None => MiniLmEmbedder::from_bundled()?,
+        Some(dir) => OnnxEmbedder::from_dir(dir)?,
+        None => OnnxEmbedder::from_bundled()?,
     };
     Ok(Box::new(embedder))
 }

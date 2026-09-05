@@ -8,7 +8,7 @@
 //!
 //! To keep the `onnx` feature compilable everywhere, this script creates an
 //! **empty placeholder** for either file when it is missing. An empty file makes
-//! `MiniLmEmbedder::from_bundled()` fail at ONNX session-build time with a clear
+//! `OnnxEmbedder::from_bundled()` fail at ONNX session-build time with a clear
 //! runtime error (not a compile error), while `--model <dir>` still works. When
 //! a placeholder is synthesized we emit a `cargo:warning` so a developer who
 //! forgot to run `scripts/fetch-model.sh` gets a visible nudge rather than a

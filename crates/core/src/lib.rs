@@ -4,7 +4,8 @@
 //!
 //! Decoupled layers:
 //! - [`Embedder`] — text → vector. [`MockEmbedder`] ships for tests/no-model use;
-//!   `MiniLmEmbedder` (feature `onnx`) does real `all-MiniLM-L6-v2` inference.
+//!   `OnnxEmbedder` (feature `onnx`) runs a real bi-encoder described by a
+//!   `ModelSpec`.
 //! - [`Index`] — top-k vector search behind a trait, with configurable
 //!   [`Metric`]: [`FlatIndex`] (exact) or [`HnswIndex`] (approximate).
 //! - [`LexicalIndex`] — optional BM25 keyword search for hybrid retrieval.
@@ -32,7 +33,7 @@ pub mod rerank;
 mod simd;
 pub mod store;
 
-pub use embed::{l2_normalize, Embedder, MockEmbedder};
+pub use embed::{l2_normalize, Embedder, MockEmbedder, ModelSpec, Pooling};
 pub use error::{Error, Result};
 pub use hnsw::HnswIndex;
 pub use index::{AnyIndex, FlatIndex, Index, IndexKind, Metric, SearchResult};
@@ -47,7 +48,7 @@ pub mod internals {
 }
 
 #[cfg(feature = "onnx")]
-pub use embed::MiniLmEmbedder;
+pub use embed::OnnxEmbedder;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -353,7 +354,7 @@ impl<E: Embedder> Database<E> {
 
     /// Top-`k` matches for the embedding of `query`, best first.
     pub fn query(&self, query: &str, k: usize) -> Result<Vec<SearchResult>> {
-        let v = self.embedder.embed(query)?;
+        let v = self.embedder.embed_query(query)?;
         self.index.query(&v, k)
     }
 
@@ -382,7 +383,7 @@ impl<E: Embedder> Database<E> {
             return Ok(vec![]);
         }
         let pool = (k * 4).max(k);
-        let v = self.embedder.embed(query)?;
+        let v = self.embedder.embed_query(query)?;
         let dense = self.index.query(&v, pool)?;
         let lexical = h.lexical.search(query, pool);
         Ok(rrf_fuse(&dense, &lexical, k))
