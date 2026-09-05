@@ -23,17 +23,17 @@ const LANES: usize = 8;
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
     let mut acc = [0.0f32; LANES];
-    let mut ca = a.chunks_exact(LANES);
-    let mut cb = b.chunks_exact(LANES);
-    for (x, y) in ca.by_ref().zip(cb.by_ref()) {
-        // `x` and `y` have length exactly LANES, so the compiler drops the
-        // bounds checks and vectorizes this fixed-width loop.
+    let (ca, ra) = a.as_chunks::<LANES>();
+    let (cb, rb) = b.as_chunks::<LANES>();
+    for (x, y) in ca.iter().zip(cb) {
+        // `x` and `y` are `[f32; LANES]`, so the length is in the type: the
+        // compiler drops the bounds checks and vectorizes this fixed-width loop.
         for l in 0..LANES {
             acc[l] += x[l] * y[l];
         }
     }
     let mut sum: f32 = acc.iter().sum();
-    for (x, y) in ca.remainder().iter().zip(cb.remainder()) {
+    for (x, y) in ra.iter().zip(rb) {
         sum += x * y;
     }
     sum
@@ -45,16 +45,16 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
 pub fn sq_euclidean(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
     let mut acc = [0.0f32; LANES];
-    let mut ca = a.chunks_exact(LANES);
-    let mut cb = b.chunks_exact(LANES);
-    for (x, y) in ca.by_ref().zip(cb.by_ref()) {
+    let (ca, ra) = a.as_chunks::<LANES>();
+    let (cb, rb) = b.as_chunks::<LANES>();
+    for (x, y) in ca.iter().zip(cb) {
         for l in 0..LANES {
             let d = x[l] - y[l];
             acc[l] += d * d;
         }
     }
     let mut sum: f32 = acc.iter().sum();
-    for (x, y) in ca.remainder().iter().zip(cb.remainder()) {
+    for (x, y) in ra.iter().zip(rb) {
         let d = x - y;
         sum += d * d;
     }

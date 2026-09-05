@@ -258,13 +258,26 @@ embsearch remove --path ./store --id doc42
 
 # Long-lived NDJSON daemon (low-latency path)
 embsearch serve  --path ./store
+
+# What a store says about itself — no model loaded, so this still answers
+# for a store the current binary refuses to open
+embsearch store-info --path ./store
+embsearch store-info --path ./store --json
 ```
 
 Flags: `--metric cosine|dot|euclidean`, `--index flat|hnsw`, and `--hybrid` (all
 fixed when a store is created; an existing store keeps its own — `--hybrid` also
 selects fused ranking at query time), `--lexical` (query only: keyword-only BM25
-ranking; errors on a non-hybrid store rather than silently downgrading), `--model <dir>` (override bundled weights
-with an on-disk `model.onnx` + `tokenizer.json`, onnx build only).
+ranking; errors on a non-hybrid store rather than silently downgrading), `--model <dir>`
+(override the bundled weights with an on-disk model directory — `model.onnx` +
+`tokenizer.json` + `model.json`, onnx build only).
+
+A store records the model that built it, and `query`/`serve` refuse a store whose
+model disagrees with the embedder, because vectors from different models are not
+comparable. `store-info` is the way out of that: it reads the manifest without
+constructing an embedder, so it can still report what built a store that nothing
+can currently open — which is exactly when a caller needs to decide between
+re-indexing and pointing at the old model.
 
 ## Daemon protocol (NDJSON)
 

@@ -122,9 +122,16 @@ pub struct ModelSpec {
     /// present because it is a property of the model, not an assumption.
     #[serde(default = "default_true")]
     pub normalize: bool,
-    /// Tokenizer truncation length. Enforced, not documented — feeding a BERT
-    /// export more positions than it has is a runtime failure, and the only
-    /// thing preventing it before was a character cap in one caller.
+    /// Tokenizer truncation length, from the model's own reference pipeline
+    /// (`sentence-transformers`' `max_seq_length`).
+    ///
+    /// Enforced rather than documented. Measured on the released v0.3.1
+    /// binary, an untruncated ~4,800-token input does not fail — the ONNX
+    /// export accepts it — it just produces a vector the model was never
+    /// trained to produce, and a measurably different one (cosine 0.230 vs
+    /// 0.192 against a fixed query). Silently different is the harder failure
+    /// to notice, and the only thing bounding input length before was a
+    /// character cap in one caller.
     pub max_tokens: usize,
     /// Prepended when embedding a query. `None` for symmetric models.
     #[serde(default)]
@@ -339,10 +346,11 @@ mod onnx {
                 .commit_from_memory(model)
                 .map_err(Error::embed)?;
             let mut tokenizer = Tokenizer::from_bytes(tokenizer_json).map_err(Error::embed)?;
-            // Enforce the model's position limit here rather than trusting every
-            // caller to cap its input. A BERT export handed more positions than
-            // it has fails at inference; a chunker's character cap is not a
-            // safety property this library gets to assume.
+            // Enforce the model's own sequence limit here rather than trusting
+            // every caller to cap its input. Overrunning it is not an error the
+            // ONNX export raises — it quietly returns a vector pooled over more
+            // tokens than the model was trained on — and a downstream chunker's
+            // character cap is not a property this library gets to assume.
             tokenizer
                 .with_truncation(Some(TruncationParams {
                     max_length: spec.max_tokens,

@@ -1,9 +1,12 @@
 # Design Note: Embedder strategy — model spec, asymmetric queries, and what to bundle
 
-Status: **proposed, unmeasured.** Every rate quoted from `hoocode` below is a
-past measurement of the *current* embedder; nothing here has been scored yet.
-The point of this note is to make the experiment runnable and to fix the two
-bugs that would otherwise make its result unshippable.
+Status: **still unmeasured; the groundwork is done.** Every rate quoted from
+`hoocode` below is a past measurement of the *current* embedder — no model has
+been compared to another yet. What has landed is what makes the comparison
+runnable: a `ModelSpec` so a model is data rather than code, and fixes for the
+two migration bugs that would have made any result unshippable.
+[`eval-runbook.md`](eval-runbook.md) is how to run it, and what is verified
+versus merely written.
 
 Companion document: `hoocode/docs/hybrid-retrieval-design.md`, which owns the
 retrieval pipeline, the gold set, and the eval harness. That document defers
@@ -22,15 +25,16 @@ note answers.
   against a 26 MB binary the consumer downloads on demand — and its one real
   advantage (8,192 tokens) is worth nothing in a pipeline that chunks at 60
   lines. Keep it reachable via `--model <dir>`, documented, unbundled.
-- The swap is **not a weights swap**. `MiniLmEmbedder` hardcodes mean pooling
-  and hardcodes `model_id`; BGE uses CLS pooling. Dropping BGE weights into
-  `crates/core/models/` today produces wrong vectors *and* a manifest that
-  still claims MiniLM, which defeats the consumer's index invalidation. A
-  `ModelSpec` describing pooling, prefixes, token limit and identity is a
-  prerequisite, not a refactor.
+- The swap is **not a weights swap**. The old `MiniLmEmbedder` hardcoded mean
+  pooling and hardcoded `model_id`; BGE uses CLS pooling. Dropping BGE weights
+  into `crates/core/models/` would have produced wrong vectors *and* a manifest
+  still claiming MiniLM, defeating the consumer's index invalidation. The
+  `ModelSpec` that fixes this was a prerequisite, not a refactor — it shipped
+  in v0.3.2.
 - Two bugs found while checking the migration path, both of which brick or
-  corrupt an existing index on a model change. They must be fixed **before**
-  any model ships. See [Migration is currently broken](#migration-is-currently-broken).
+  corrupt an existing index on a model change — now **fixed**, and not a moment
+  early: v0.3.2 shipped the `model_id` change that arms the first one. See
+  [Migration was broken](#migration-was-broken--both-bugs-are-now-fixed).
 - The 512-token window unlocks a chunk-size experiment the consumer cannot
   currently run. It may matter more than the model's own retrieval delta.
 
@@ -134,10 +138,19 @@ that path rather than pretending it does not exist.
 
 ---
 
-## Migration is currently broken
+## Migration was broken — both bugs are now fixed
 
-Both of these are live bugs today, independent of which model we pick. Either
-one turns a model upgrade into a support incident.
+Both were live bugs, independent of which model we pick, and either one turned
+a model upgrade into a support incident. Recorded here with their fixes,
+because the reasoning is what stops them coming back.
+
+**They stopped being hypothetical.** `model_id` now carries a spec hash, so
+v0.3.2 reports `all-MiniLM-L6-v2-int8.1f635576` where v0.3.1 reported
+`all-MiniLM-L6-v2-int8` — verified by running both binaries. That is Bug A's
+exact trigger, shipped. Nobody broke on release day only because `ensureTool`
+returns early when the binary already exists (`tools-manager.ts:467`), so
+existing users kept v0.3.1 alongside their v0.3.1 store. It would have fired on
+the next binary refresh.
 
 ### Bug A — a model change bricks the consumer's index instead of rebuilding it
 
@@ -161,23 +174,31 @@ The adjacent hybrid-mismatch branch (line 316) does the right thing — close,
 `rmSync(storeDir)`, reopen. The model path needs the same treatment, and it
 needs the model id *before* spawning against the store.
 
-**Fix (this repo):** add a store-inspection command that reads
+**Fixed (this repo):** `embsearch store-info --path <dir> [--json]` reads
 `manifest.json` without constructing an embedder:
 
 ```
-embsearch store-info --path <dir> --json
-  -> {"model_id":"…","dim":384,"rows":N,"hybrid":true,"index":"flat","metric":"cosine"}
+$ embsearch store-info --path ./store --json
+{"format_version":1,"model_id":"all-MiniLM-L6-v2-int8","dim":384,
+ "metric":"cosine","index":"flat","hybrid":false,"rows":3,"live":3}
 ```
 
-It answers for a store that no current binary can open, which is exactly the
-case that matters. A daemon-side `info` cannot do this — reaching `info`
-already requires a successful open.
+It answers for a store no current binary can open, which is exactly the case
+that matters — verified by reading a v0.3.1 store with a binary that refuses to
+open it. A daemon-side `info` cannot do this: reaching `info` already requires
+a successful open.
 
-**Fix (consumer):** compare `store-info.model_id` against the binary's model id
-before spawning; on disagreement `rmSync(storeDir)` and start clean. Rejected
-alternative: making `serve` auto-wipe a mismatched store. Deleting a user's
-index as a side effect of starting a daemon is not a decision this layer gets
-to make silently.
+**Fixed (consumer):** `EmbsearchService.start` catches the daemon's refusal,
+confirms via `store-info` that a readable store is what it choked on, then
+wipes and reopens. Only a store that is *present and readable* is discarded —
+if `store-info` cannot read it either, the problem is not a model mismatch and
+the original failure stands, because destroying an index would be the wrong
+answer to an unknown fault.
+
+Rejected alternative: making `serve` auto-wipe a mismatched store. Deleting a
+user's index as a side effect of starting a daemon is not a decision that layer
+gets to make silently — the consumer knows whether it can rebuild, and the
+library does not.
 
 ### Bug B — a chunker version bump leaks orphaned vectors
 
@@ -194,8 +215,11 @@ exists anywhere, retrievable forever.
 The store is upserted by id, so this is invisible in chunk counts and invisible
 in the sidecar. It surfaces as occasional stale hits.
 
-**Fix:** treat *any* stale sidecar the way the hybrid mismatch is treated —
-wipe and rebuild. Same code path as Bug A's fix.
+**Fixed:** a stale sidecar over a non-empty store now takes the store with it,
+through the same `rebuildFrom` path as Bug A and the pre-existing hybrid
+mismatch — three symptoms, one recovery. Resetting the sidecar alone was never
+enough, because the sidecar is the only record of how many chunks each file
+produced.
 
 This matters here because the plan deliberately bumps `CHUNKER_VERSION`
 alongside the model (see below), which is precisely the combination that
@@ -227,11 +251,16 @@ produces a binary that:
   being queried with BGE vectors;
 - never truncates, because the model's token limit lives in a comment.
 
-That last one is a latent bug even now. `encode_batch` is called with no
-truncation configured, so a >512-token input produces a sequence longer than the
-positional table. The consumer's 1,000-char chunk cap is currently the only
-thing preventing it, which means the library is safe by a coincidence of its
-caller's configuration.
+That last one is a live defect, though a quieter one than it first looked.
+`encode_batch` is called with no truncation configured, so a long input is
+embedded over its full length. Measured against the released v0.3.1 binary, a
+~4,800-token document does **not** fail — the ONNX export accepts it — it
+simply returns a vector pooled over far more tokens than the model was trained
+on, and a measurably different one (cosine 0.230 against a fixed query, versus
+0.192 once truncated to the reference pipeline's 256). No error, no warning,
+just a worse vector. The consumer's 1,000-char chunk cap is the only thing
+currently bounding it, which means the library's output is correct by a
+coincidence of its caller's configuration.
 
 ### Shape
 
@@ -426,15 +455,18 @@ what running two model arms needs. That part is already built.
 
 ## Rollout
 
-1. **`store-info` + `ModelSpec` + `embed_query`, no model change.** `model_id`
-   for the existing bundled model keeps its current string, so nothing
-   invalidates and nothing rebuilds. Ships as a minor release.
-2. **Consumer: wipe-and-rebuild on any stale sidecar; pass `--model`; record
-   `model_id` in provenance.** Requires the `store-info` floor from (1), gated
-   the way `MIN_LEXICAL_RETRIEVER_VERSION` and `MIN_RERANK_VERSION` already gate
-   capability — this codebase does not degrade silently across a version
-   boundary and should not start here.
-3. **Run A0–A2.** Decide on evidence.
+1. ~~**`ModelSpec` + `embed_query`.**~~ Shipped in v0.3.2. Note what this
+   rollout got wrong: it was meant to leave `model_id` untouched so nothing
+   invalidated, and the spec hash changed it anyway. Harmless in the event —
+   `ensureTool` does not upgrade an installed binary — but it armed Bug A
+   before Bug A was fixed, which is the wrong order.
+2. ~~**`store-info` + consumer wipe-and-rebuild.**~~ Done, unreleased. Needs a
+   release before any consumer can rely on it. `probeStore` degrades to the old
+   behaviour against a binary too old to have the subcommand, so no explicit
+   version floor is needed — unlike `MIN_LEXICAL_RETRIEVER_VERSION`, where an
+   old daemon silently ignored an unknown field instead of failing.
+3. **Run A0–A2.** Decide on evidence. See
+   [`eval-runbook.md`](eval-runbook.md).
 4. **If (3) wins: run A3/A4**, bump `CHUNKER_VERSION`, fold in the parked
    blank-line fix.
 5. **Ship the model.** `model_id` changes, both ends invalidate, every user
