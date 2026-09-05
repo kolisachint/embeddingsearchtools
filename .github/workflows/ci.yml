@@ -23,3 +23,21 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+
+  # The `onnx` module is not built by the job above (the default backend is the
+  # mock embedder), and it cannot be built at all without network access to
+  # ONNX Runtime — so on many machines it is never compiled locally. That made
+  # it the one part of the crate whose first compile happened during a release.
+  # This job closes that gap. It needs no model weights: build.rs synthesizes
+  # empty placeholders, which is a link-time concern, not a compile-time one.
+  onnx:
+    name: Compile onnx backend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy (onnx)
+        run: cargo clippy --workspace --all-targets --features embsearch-core/onnx,embsearch-cli/onnx -- -D warnings
