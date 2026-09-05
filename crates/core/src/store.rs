@@ -174,9 +174,11 @@ fn read_f32_le(path: &Path) -> Result<Vec<f32>> {
             bytes.len()
         )));
     }
-    let mut out = Vec::with_capacity(bytes.len() / 4);
-    for chunk in bytes.chunks_exact(4) {
-        out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    // The length check above rules out a remainder, so the tail is always empty.
+    let (words, _) = bytes.as_chunks::<4>();
+    let mut out = Vec::with_capacity(words.len());
+    for word in words {
+        out.push(f32::from_le_bytes(*word));
     }
     Ok(out)
 }
