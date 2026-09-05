@@ -146,21 +146,44 @@ Measured against the released v0.3.2 binary, downloaded and run:
   the same document without error. The defect was a silently worse vector, not
   a failure.
 - ✅ `store-info` reads a v0.3.1 store that the v0.3.2 binary refuses to open.
-- ❌ **CLS pooling has never been executed.** No BGE weights were reachable.
-  The eval-build smoke test is the first thing that will run it.
-- ❌ **The query-prefix path has never been executed**, for the same reason.
-- ❌ No model has been compared to another. Every number in
-  `embedder-strategy.md` is a prior measurement of the *current* embedder.
+- ✅ **CLS pooling executes and is sane.** Ran locally against real
+  `Xenova/bge-small-en-v1.5` int8 weights: on "wolf chasing a rabbit" the fox
+  document scores 0.702 against 0.360 for an unrelated infrastructure one.
+- ✅ **The query-prefix path executes.** `bge-small-prefixed` produces a
+  distinct `model_id` (`…-int8-q.5e71728d`) and different scores (fox 0.661),
+  confirming the prefix reaches the tokenizer rather than being dropped.
+- ✅ **The onnx backend compiles locally**, in 49s once `cdn.pyke.io` is
+  reachable. Its first compile is no longer during a release.
+- ✅ **A0–A2 have run.** See
+  [Results](embedder-strategy.md#results-a0a2). bge-small wins on every
+  endpoint, nothing clears p≤0.05, the prefix loses to no prefix.
+- ❌ **A3/A4 (chunk window) have not run.** They need the chunker change below,
+  and they are where the 512-token window would actually pay off.
+- ❌ **N1 (nomic) has not run.** Ceiling-pricing only, never a candidate.
 
 `OnnxEmbedder` is now compiled on every PR (the `onnx` job in `ci.yml`), which
 closes the gap where that code path got its first compile during a release.
 
 ## Open items
 
-1. **Run the eval.** Everything above.
+1. **Decide on A1.** It wins every endpoint and clears none of them. The
+   pre-registered rule says do not ship on this evidence; the effect sizes say
+   the lever is real. Options: ship anyway and accept the threshold was too
+   strict for n=62, enlarge the gold set on the semantic classes and re-run, or
+   go to A3/A4 first on the theory that the window matters more than the model.
 2. **A3/A4 need a chunker change** in `hoocode` — raise `CHUNK_MAX_CHARS`, bump
    `CHUNKER_VERSION`, and fold in the blank-line fix parked at
    `hybrid-retrieval-design.md:846` so users pay one rebuild rather than two.
+   Budget for it: indexing is already 3.5× slower on bge-small (~60 min vs ~17
+   for MiniLM, 20,430 chunks, 8 cores) and a bigger cap pushes that up.
+3. **Drop `bge-small-prefixed` from `fetch-model.sh`** once A1 is settled. A2
+   answered its question and the answer was no; leaving the id around invites
+   someone to ship it.
+4. **Consider replacing `test/fixtures/search-eval-baseline.json` with A0.** The
+   committed baseline is the contaminated `ffeaad9` corpus and is what
+   `search-eval:compare` defaults to, so the default comparison is against a
+   record the design note calls unusable. A0 is a clean control on a known SHA.
+   Not done here because it changes the default target for every future run.
 3. **Nomic** stays documented-but-unbundled. `--model <dir>` reaches it; adding
    a `nomic` id to `fetch-model.sh` needs a spec with `search_query:` /
    `search_document:` prefixes and `dim` 768.
