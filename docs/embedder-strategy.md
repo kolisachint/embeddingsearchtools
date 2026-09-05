@@ -1,12 +1,10 @@
 # Design Note: Embedder strategy — model spec, asymmetric queries, and what to bundle
 
-Status: **still unmeasured; the groundwork is done.** Every rate quoted from
-`hoocode` below is a past measurement of the *current* embedder — no model has
-been compared to another yet. What has landed is what makes the comparison
-runnable: a `ModelSpec` so a model is data rather than code, and fixes for the
-two migration bugs that would have made any result unshippable.
-[`eval-runbook.md`](eval-runbook.md) is how to run it, and what is verified
-versus merely written.
+Status: **measured — A0–A2 have run.** bge-small beats MiniLM on every
+pre-registered endpoint with a clean guardrail, and **no endpoint clears
+p≤0.05**. The query prefix does not earn its place. See
+[Results](#results-a0a2) for the numbers and what they do and do not license.
+[`eval-runbook.md`](eval-runbook.md) is how to re-run it.
 
 Companion document: `hoocode/docs/hybrid-retrieval-design.md`, which owns the
 retrieval pipeline, the gold set, and the eval harness. That document defers
@@ -451,6 +449,74 @@ The service already supports a `storeDir` override "so a second index can exist
 for the same repo without colliding with the primary one" — which is exactly
 what running two model arms needs. That part is already built.
 
+Both landed in hoocode #226. The provenance fix earned itself immediately: all
+three arms record `binaryVersion` "embsearch 0.3.2" and three different
+`modelId`s, so under the old scheme the records would have been
+indistinguishable — the exact failure it was written to prevent.
+
+---
+
+## Results (A0–A2)
+
+Run 2026-09-05 on corpus `1eab9db0`, 62 queries, 20,430 chunks, one binary
+(embsearch 0.3.2) with `--model` per arm. Config `auto +rr`, the shipped
+default path. Records: hoocode `packages/coding-agent/runs/a{0,1,2}-*.json`.
+
+| arm | model | MRR | R@10 | R@50 | sem MRR | sem R@10 |
+|---|---|---|---|---|---|---|
+| A0 | MiniLM int8 (mean) | 0.595 | 0.694 | 0.774 | 0.173 | 0.333 |
+| A1 | **bge-small int8 (CLS)** | **0.638** | **0.750** | 0.839 | **0.273** | **0.479** |
+| A2 | bge-small int8 + query prefix | 0.613 | 0.750 | 0.871 | 0.209 | 0.479 |
+
+### Against the pre-registered endpoints
+
+A0 → A1, paired sign test, ties discarded:
+
+| endpoint | delta | split | p | verdict |
+|---|---|---|---|---|
+| **Primary** — MRR, all 62 | +0.043 | 13+/7− | 0.263 | **not significant** |
+| **Secondary** — sem MRR, n=24 | +0.100 | 12+/7− | 0.359 | not significant |
+| **Secondary** — sem R@10, n=24 | +0.146 | 5+/2− | 0.453 | not significant |
+| **Reach** — R@50, all 62 | +0.065 | 8+/3− | 0.227 | not significant |
+| **Guardrail** — exact-symbol, error-fragment | +0.011 / 0.000 MRR | — | — | **clean, no regression** |
+
+**The primary endpoint fails.** Every metric moves the right way, the guardrail
+is untouched, and nothing reaches p≤0.05. That threshold was fixed in advance
+precisely so this could not be renegotiated after seeing the numbers, so it is
+not being renegotiated now.
+
+What the effect sizes look like anyway, stated as description and not as a
+claim: semantic MRR +58% relative (0.173→0.273) and semantic R@10 +44%
+(0.333→0.479). Only 19 of 62 queries move at all, which is where the power
+goes — the note predicted this and it still binds.
+
+### The premise survives
+
+Falsification was pre-registered as "A1/A2 do not beat A0 on the semantic
+subgroup". A1 beats it on both subgroup metrics, so the embedder hypothesis in
+`hybrid-retrieval-design.md:853` is **not** falsified: the remaining headroom
+really is in the dense leg. The evidence is directionally consistent and
+underpowered, which is a different thing from absent — and a different thing
+from proven.
+
+### The query prefix does not earn its place
+
+A2 existed to answer exactly this, and the answer is no. Against A1 the prefix
+costs MRR (−0.025 overall, −0.064 on the semantic subgroup, 6+/10−) while
+buying reach (R@50 +0.032). It helps find the right chunk somewhere in the top
+50 and hurts putting it near the top, which is the wrong trade for a tool whose
+caller reads a handful of results. **A1 is the winner of A1/A2** — ship
+`bge-small` unprefixed, drop `bge-small-prefixed` from `fetch-model.sh`.
+
+### The cost nobody priced
+
+A1/A2 each took **~60 min to index 20,430 chunks against A0's ~17 min** — 3.5×,
+on 8 cores. The note priced this change in download size (+10 MB) and said
+nothing about indexing time, because CLS pooling was not the cost; the 512-token
+window is. Every user pays it once per re-index, and A3/A4 raise the chunk cap,
+which pushes it further. This belongs in the shipping decision alongside the
+retrieval delta.
+
 ---
 
 ## Rollout
@@ -460,15 +526,21 @@ what running two model arms needs. That part is already built.
    invalidated, and the spec hash changed it anyway. Harmless in the event —
    `ensureTool` does not upgrade an installed binary — but it armed Bug A
    before Bug A was fixed, which is the wrong order.
-2. ~~**`store-info` + consumer wipe-and-rebuild.**~~ Done, unreleased. Needs a
-   release before any consumer can rely on it. `probeStore` degrades to the old
+2. ~~**`store-info` + consumer wipe-and-rebuild.**~~ Shipped in **v0.3.3**;
+   consumer half merged as hoocode #226. `probeStore` degrades to the old
    behaviour against a binary too old to have the subcommand, so no explicit
    version floor is needed — unlike `MIN_LEXICAL_RETRIEVER_VERSION`, where an
    old daemon silently ignored an unknown field instead of failing.
-3. **Run A0–A2.** Decide on evidence. See
-   [`eval-runbook.md`](eval-runbook.md).
-4. **If (3) wins: run A3/A4**, bump `CHUNKER_VERSION`, fold in the parked
-   blank-line fix.
+3. ~~**Run A0–A2.**~~ Done — see [Results](#results-a0a2). **The decision this
+   step was supposed to produce is not clean**, so it is written down rather
+   than resolved by fiat: A1 wins every endpoint, clears none, and the
+   guardrail is untouched. The pre-registered rule says that is not enough to
+   ship on. Open item 1 in the runbook lists the three ways forward.
+4. **A3/A4 — not started, and now the more interesting arm.** A1's gain is real
+   but underpowered, and the 512-token window it unlocks is untested; the note
+   already suspected the window "may matter more than the model's own retrieval
+   delta". Needs `CHUNK_MAX_CHARS` raised, `CHUNKER_VERSION` bumped, and the
+   parked blank-line fix folded in.
 5. **Ship the model.** `model_id` changes, both ends invalidate, every user
    pays exactly one re-index. Consumer pins a version floor for the new
    `model_id`.
@@ -479,6 +551,10 @@ Step 1 is worth doing whether or not any model ever changes: it fixes a latent
 truncation bug, removes a silent-corruption path, and is the difference between
 "swap the weights" being a two-line change that quietly breaks things and a
 supported operation.
+
+Step 6 gains a companion: **drop `bge-small-prefixed`** from
+`scripts/fetch-model.sh`. A2 answered its question and the answer was no, and
+leaving the id in place invites someone to ship the worse of the two.
 
 ## Explicitly not doing
 
