@@ -227,11 +227,16 @@ produces a binary that:
   being queried with BGE vectors;
 - never truncates, because the model's token limit lives in a comment.
 
-That last one is a latent bug even now. `encode_batch` is called with no
-truncation configured, so a >512-token input produces a sequence longer than the
-positional table. The consumer's 1,000-char chunk cap is currently the only
-thing preventing it, which means the library is safe by a coincidence of its
-caller's configuration.
+That last one is a live defect, though a quieter one than it first looked.
+`encode_batch` is called with no truncation configured, so a long input is
+embedded over its full length. Measured against the released v0.3.1 binary, a
+~4,800-token document does **not** fail — the ONNX export accepts it — it
+simply returns a vector pooled over far more tokens than the model was trained
+on, and a measurably different one (cosine 0.230 against a fixed query, versus
+0.192 once truncated to the reference pipeline's 256). No error, no warning,
+just a worse vector. The consumer's 1,000-char chunk cap is the only thing
+currently bounding it, which means the library's output is correct by a
+coincidence of its caller's configuration.
 
 ### Shape
 
