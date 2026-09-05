@@ -10,31 +10,28 @@ Runtime access needs to do to produce numbers.
 Written in an environment that could not finish it, for three reasons worth
 knowing before you start — none of them apply on a normal laptop:
 
-| Blocked | Why | Consequence |
-|---|---|---|
-| `huggingface.co` | egress policy | no model weights could be fetched |
-| `cdn.pyke.io` | egress policy | `--features onnx` could not be compiled *at all* |
-| `.github/workflows/*` | OAuth token lacks `workflow` scope | the eval workflow could not be installed |
+| Blocked | Why | Consequence | Status |
+|---|---|---|---|
+| `huggingface.co` | egress policy | no model weights could be fetched | cleared |
+| `cdn.pyke.io` | egress policy | `--features onnx` could not be compiled *at all* | cleared |
+| `.github/workflows/*` | OAuth token lacks `workflow` scope | the eval workflow could not be installed | **done** — installed |
 
 So the `onnx` code path was never compiled locally. It **has** been executed —
 the released v0.3.2 binary was downloaded and run (see
 [Verified](#verified--not-verified) below) — but the eval itself has not been
 run, and no model has been compared to another.
 
-### Step 0: install the eval workflow
+### Step 0: install the eval workflow — done
 
-The one manual step. `docs/workflows/pending/eval-build.yml` is complete and
-ready; it just could not be written into `.github/workflows/`.
+`eval-build.yml` and the `onnx` CI job now live in `.github/workflows/`, and
+`docs/workflows/pending/` is gone with them. Nothing to copy.
 
-```bash
-cp docs/workflows/pending/eval-build.yml .github/workflows/
-# ci.yml in pending/ predates the as_chunks clippy fix — take only its `onnx`
-# job and add it to the live ci.yml rather than copying the file over.
-git add .github/workflows && git commit -m "ci: install eval-build workflow"
-git push   # needs a token with `workflow` scope
-```
+The caution that used to sit here — take only the `onnx` job, because
+`pending/ci.yml` predates the `as_chunks` clippy fix — turned out to be moot:
+that fix was to `simd.rs`, and by merge time the two `test` jobs were
+byte-identical, so both files were installed as they stood.
 
-Then: **Actions → Eval build → Run workflow**, models
+To run it: **Actions → Eval build → Run workflow**, models
 `minilm,bge-small,bge-small-prefixed`.
 
 It publishes to a **prerelease** tag (`eval-latest`). That is a safety
