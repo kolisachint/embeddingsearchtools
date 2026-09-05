@@ -17,9 +17,9 @@ on:
   workflow_dispatch:
     inputs:
       models:
-        description: 'Comma-separated model ids from scripts/fetch-model.sh (minilm, bge-small, bge-small-prefixed)'
+        description: 'Comma-separated model ids from scripts/fetch-model.sh (minilm, bge-small, bge-small-prefixed). bge-small-prefixed measured worse than bge-small - opt in deliberately.'
         required: false
-        default: 'minilm,bge-small,bge-small-prefixed'
+        default: 'minilm,bge-small'
       tag:
         description: 'Prerelease tag to publish under (reused and clobbered across runs)'
         required: false

@@ -110,6 +110,17 @@ EOF
     # Same weights as bge-small, with the retrieval instruction on the query
     # side only. A distinct `name`, so the two produce different model ids and
     # a store built under one cannot be opened under the other.
+    #
+    # MEASURED WORSE THAN PLAIN `bge-small` — not a shipping candidate. Arm A2
+    # existed to ask whether the prefix earns its place and the answer was no:
+    # against A1 it cost MRR (-0.025 overall, -0.064 on the semantic subgroup)
+    # to buy reach (R@50 +0.032). It helps find the right chunk somewhere in
+    # the top 50 and hurts putting it near the top, which is the wrong trade
+    # for a caller that reads a handful of results.
+    #
+    # Kept fetchable because that result is as underpowered as every other in
+    # the run (p=0.454) and anyone enlarging the gold set should be able to
+    # re-test it. See docs/embedder-strategy.md#results-a0a2.
     MODEL_URL="https://huggingface.co/Xenova/bge-small-en-v1.5/resolve/main/onnx/model_quantized.onnx"
     TOKENIZER_URL="https://huggingface.co/Xenova/bge-small-en-v1.5/resolve/main/tokenizer.json"
     read -r -d '' MODEL_SPEC <<'EOF' || true
