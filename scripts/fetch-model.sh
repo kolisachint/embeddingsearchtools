@@ -39,7 +39,9 @@ usage() {
   cat <<'EOF'
 
 Options:
-  --model <minilm|bge-small>  Which embedding model to fetch (default: minilm)
+  --model <id>                Which embedding model to fetch (default: minilm)
+                              minilm | minilm-512 | bge-small |
+                              bge-small-prefixed | nomic
   --dest <dir>                Where to put it (default: crates/core/models)
   --with-reranker             Also fetch the cross-encoder reranker
 EOF
@@ -83,6 +85,35 @@ case "$MODEL_ID" in
   "pooling": "mean",
   "normalize": true,
   "max_tokens": 256
+}
+EOF
+    ;;
+  minilm-512)
+    # Identical weights to `minilm`, with the token limit raised 256 -> 512.
+    #
+    # This exists to separate two things the A0/A1 comparison confounded.
+    # MiniLM's reference pipeline sets max_seq_length 256, and the consuming
+    # chunker caps chunks at 1000 characters believing that to be about 256
+    # tokens. Measured against this tokenizer on a real code corpus it is 313
+    # tokens at the median, so `minilm` truncates 85.8% of chunks and drops
+    # 20.3% of the corpus's tokens, always from the tail of a chunk. bge-small
+    # at 512 drops 0.1%. So A1 was never the isolated "model effect" it was
+    # billed as: it changed the model AND gave the dense leg a fifth more of
+    # the corpus to read.
+    #
+    # BERT position embeddings go to 512, so this is a supported length rather
+    # than an extrapolation — but it is past what the model was tuned for, and
+    # that is the point: it prices the coverage half on its own. Run it as an
+    # arm, not as a default.
+    MODEL_URL="https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/main/onnx/model_quantized.onnx"
+    TOKENIZER_URL="https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/main/tokenizer.json"
+    read -r -d '' MODEL_SPEC <<'EOF' || true
+{
+  "name": "all-MiniLM-L6-v2-int8-512",
+  "dim": 384,
+  "pooling": "mean",
+  "normalize": true,
+  "max_tokens": 512
 }
 EOF
     ;;
@@ -134,8 +165,38 @@ EOF
 }
 EOF
     ;;
+  nomic)
+    # nomic-ai/nomic-embed-text-v1.5. The ceiling arm: 768-d and ~137 MB
+    # quantized against bge-small's 384-d and 34 MB, so it is priced as "what
+    # does a much larger bi-encoder buy", not as a shipping candidate.
+    #
+    # Every field below is from the model's own config rather than inferred:
+    # `1_Pooling/config.json` sets mean pooling (NOT cls — it differs from
+    # bge-small here), `word_embedding_dimension` is 768, and `config.json`
+    # gives `max_position_embeddings` 2048 with no rotary scaling. The card's
+    # 8192 `max_seq_length` needs that scaling to be real, so 2048 is the
+    # honest cap; it costs nothing either way, since chunks reach ~313 tokens
+    # and the tokenizer pads each batch to its own longest member.
+    #
+    # Both prefixes are mandatory for this model, not optional flavouring:
+    # it was trained with asymmetric task instructions, and omitting them
+    # silently degrades retrieval rather than failing.
+    MODEL_URL="https://huggingface.co/nomic-ai/nomic-embed-text-v1.5/resolve/main/onnx/model_quantized.onnx"
+    TOKENIZER_URL="https://huggingface.co/nomic-ai/nomic-embed-text-v1.5/resolve/main/tokenizer.json"
+    read -r -d '' MODEL_SPEC <<'EOF' || true
+{
+  "name": "nomic-embed-text-v1.5-int8",
+  "dim": 768,
+  "pooling": "mean",
+  "normalize": true,
+  "max_tokens": 2048,
+  "query_prefix": "search_query: ",
+  "document_prefix": "search_document: "
+}
+EOF
+    ;;
   *)
-    echo "unknown --model '$MODEL_ID' (expected: minilm, bge-small, bge-small-prefixed)" >&2
+    echo "unknown --model '$MODEL_ID' (expected: minilm, minilm-512, bge-small, bge-small-prefixed, nomic)" >&2
     exit 2
     ;;
 esac

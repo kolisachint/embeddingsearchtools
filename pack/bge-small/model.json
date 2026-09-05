@@ -1,7 +1,0 @@
-{
-  "name": "bge-small-en-v1.5-int8",
-  "dim": 384,
-  "pooling": "cls",
-  "normalize": true,
-  "max_tokens": 512
-}

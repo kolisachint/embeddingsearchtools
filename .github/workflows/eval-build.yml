@@ -17,7 +17,7 @@ on:
   workflow_dispatch:
     inputs:
       models:
-        description: 'Comma-separated model ids from scripts/fetch-model.sh (minilm, bge-small, bge-small-prefixed). bge-small-prefixed measured worse than bge-small - opt in deliberately.'
+        description: 'Comma-separated model ids from scripts/fetch-model.sh (minilm, minilm-512, bge-small, bge-small-prefixed, nomic). bge-small-prefixed measured worse than bge-small - opt in deliberately. minilm-512 is the coverage control, nomic is ceiling-pricing at 137MB and 20x MiniLM indexing time - neither is a shipping candidate.'
         required: false
         default: 'minilm,bge-small'
       tag:
