@@ -166,19 +166,39 @@ closes the gap where that code path got its first compile during a release.
 
 ## Open items
 
-1. **Decide on A1.** It wins every endpoint and clears none of them. The
-   pre-registered rule says do not ship on this evidence; the effect sizes say
-   the lever is real. Options: ship anyway and accept the threshold was too
-   strict for n=62, enlarge the gold set on the semantic classes and re-run, or
-   go to A3/A4 first on the theory that the window matters more than the model.
+1. **Decide on A1 — currently: not shipping, MiniLM stays.** It wins every
+   endpoint and clears none of them, and the cost is concrete where the benefit
+   is uncertain: 3.5× indexing time, paid by every user at once when `model_id`
+   changes.
+
+   The argument that settled it: **you get one free re-index and this would
+   spend it.** A3/A4 force an invalidation too, and this note already suspects
+   the chunk window "may matter more than the model's own retrieval delta" — so
+   shipping the model alone burns the invalidation on the smaller, unproven
+   half. If both land, they should land together.
+
+   The binding constraint is the gold set, not the model: 42 of 62 queries tied,
+   so the eval cannot resolve a difference this size. Enlarging the semantic
+   classes (24 queries, where the whole effect lives) is far cheaper than a
+   3.5× indexing regression and is what would actually let anyone decide.
+
+   One caveat on that 3.5×: 17→60 min is *total eval wall time*, dominated by
+   embedding ~40k chunks but not isolated from query work. A0→A1 is a clean
+   comparison (both foreground, both timed); A2's ~86 min ran against other
+   load and should not be trusted. Per-*query* latency was never measured — one
+   forward pass on a short query against a warm daemon, likely single-digit ms
+   for both, and almost certainly not the thing to worry about.
 2. **A3/A4 need a chunker change** in `hoocode` — raise `CHUNK_MAX_CHARS`, bump
    `CHUNKER_VERSION`, and fold in the blank-line fix parked at
    `hybrid-retrieval-design.md:846` so users pay one rebuild rather than two.
    Budget for it: indexing is already 3.5× slower on bge-small (~60 min vs ~17
    for MiniLM, 20,430 chunks, 8 cores) and a bigger cap pushes that up.
-3. **Drop `bge-small-prefixed` from `fetch-model.sh`** once A1 is settled. A2
-   answered its question and the answer was no; leaving the id around invites
-   someone to ship it.
+3. ~~**Drop `bge-small-prefixed`.**~~ Done, but softened on reflection: it is
+   marked as measured-worse in `fetch-model.sh` and off the eval-build default
+   list, **not deleted**. The risk was shipping it, not fetching it — and A2's
+   negative result is as underpowered (p=0.454) as A1's positive one, so
+   anyone enlarging the gold set should be able to re-test the prefix rather
+   than find the option gone.
 4. **Consider replacing `test/fixtures/search-eval-baseline.json` with A0.** The
    committed baseline is the contaminated `ffeaad9` corpus and is what
    `search-eval:compare` defaults to, so the default comparison is against a

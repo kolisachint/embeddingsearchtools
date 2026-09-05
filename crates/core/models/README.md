@@ -70,6 +70,12 @@ Known model ids are `minilm` (the bundled default), `bge-small`, and
 `bge-small-prefixed` (the same weights with BGE's retrieval instruction on the
 query side — a distinct `name`, so the two cannot share a store).
 
+`bge-small-prefixed` **measured worse than plain `bge-small`** and is not a
+shipping candidate; it stays fetchable so the result can be re-tested on a
+larger gold set. `bge-small` itself beat the bundled MiniLM on every endpoint
+without reaching significance on any of them, so the bundled default has not
+changed. See [`docs/embedder-strategy.md`](../../../docs/embedder-strategy.md#results-a0a2).
+
 A store records the model that built it, and opening it with a different one is
 refused rather than silently producing nonsense. Switching models means
 re-indexing.
