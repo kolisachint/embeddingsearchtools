@@ -75,6 +75,33 @@ bun run search-eval -- \
 Omit `--model-dir` for the MiniLM control: it uses the model bundled in the
 binary.
 
+### Screening runs: `--fast`
+
+A full arm indexes 22k chunks — about 6 min on MiniLM, 22 on bge-small and
+nearly two hours on nomic. `--fast <chunks>` cuts the corpus to a budget so a
+whole sweep fits in a coffee break:
+
+```bash
+bun run search-eval -- --corpus-ref <SHA> --fast 6000 --daemon-hybrid \
+  --embsearch-binary /path/to/embsearch --out runs/f1.json
+```
+
+It keeps **every gold-bearing file** and draws distractors with a fixed seed, so
+all 62 queries stay answerable and two arms see byte-identical corpora. The
+subsample is folded into the worktree path and the store key, so a `--fast` run
+cannot collide with a full one.
+
+**It is not a cheap version of the real eval.** A smaller distractor pool makes
+retrieval easier: at 6,027 chunks the A0 control reads MRR 0.659 against its
+full-corpus 0.595. More queries also tie, which costs the sign test power it was
+already short of. Use it to rank arms against each other, never to state an
+absolute number. Records carry `corpusSubsample` so the two kinds cannot be
+mistaken for one another.
+
+It does track the full corpus on the thing it is for — A0→A1 measured +0.059
+MRR and +0.131 semantic MRR at 6k against +0.043 and +0.100 on the full corpus,
+same direction and rough size at a quarter of the cost.
+
 `--model-dir` suffixes the store directory, so arms do not collide and each
 pays its own indexing cost once (~17k chunks). The suffix is empty without the
 flag, so an ordinary run reuses the store it always did.
@@ -157,9 +184,45 @@ Measured against the released v0.3.2 binary, downloaded and run:
 - ✅ **A0–A2 have run.** See
   [Results](embedder-strategy.md#results-a0a2). bge-small wins on every
   endpoint, nothing clears p≤0.05, the prefix loses to no prefix.
-- ❌ **A3/A4 (chunk window) have not run.** They need the chunker change below,
-  and they are where the 512-token window would actually pay off.
-- ❌ **N1 (nomic) has not run.** Ceiling-pricing only, never a candidate.
+- ✅ **Indexing cost is now measured per model, not inferred.** Run records
+  carry `timing.indexSeconds` / `timing.querySeconds`, and
+  `scripts/bench-index.py` times the daemon's `bulk` path directly. The two
+  agree within 4% (62 vs 64.3 chunks/s for MiniLM, 17.0 vs 16.9 for
+  bge-small), which is the check that either one is measuring what it claims.
+- ✅ **The 3.5× is decomposed**: ~1.8× window, ~2.1× model depth. See
+  [the cost section](embedder-strategy.md#the-cost-nobody-priced).
+- ✅ **The truncation confound is ruled out.** `minilm-512` was added as the
+  missing control and shows the coverage difference is not what A1 won on.
+- ✅ **`nomic` runs.** It needed no code change — 768 dims, mean pooling and
+  both `search_*` prefixes are all data in `model.json`, and its ONNX export
+  does carry `token_type_ids`, which was the one thing that could have forced
+  one.
+- ⚠️ **A3/A4 ran, but not as written.** Their premise — "the window the model
+  unlocks" — is void: at cap 1000 only 0.5% of chunks exceed 512 tokens, so
+  there is no headroom to unlock, and cap 2000 *overruns* the window (66% of
+  chunks truncated, 17.6% of tokens dropped). Re-specified on the record as a
+  descriptive "should the shipped cap go up" arm. Cap 2000 wins every metric
+  and indexes 26% **faster** — the cost assumption in this runbook was
+  backwards — but nothing is significant, the guardrail slips for the first
+  time, and line-overlap scoring mechanically favours bigger chunks. Not
+  shippable evidence; see
+  [A3/A4](embedder-strategy.md#a3a4-the-premise-was-void-so-the-arm-was-re-specified).
+- ❌ **N1 (nomic) is priced but not scored.** At 3.2 chunks/s it is 20× MiniLM
+  — 114 min for a full corpus — and 137 MB quantized against bge-small's 34.
+  Ceiling-pricing only, as intended; a candidate it is not. It does *run*
+  correctly (768-d, mean pooling, both prefixes), so scoring it is a matter of
+  patience, not plumbing.
+
+  An attempt at the 6k screening arm was abandoned after 2h20m having indexed
+  ~2,000 of 6,028 chunks — under 0.7 chunks/s against the 3.2 the standalone
+  bench measured. **The gap is unexplained.** It is not the eval path in
+  general: bge-small runs at 17.0 chunks/s under the harness against 16.9 in
+  the bench, so only nomic diverges. The untested hypothesis is input shapes —
+  `bench-index.py` sends uniform 48-record batches while the indexer batches
+  *per file* (~16 records on average, highly variable), and ORT plans and
+  allocates per distinct input shape, which a 137 MB model would feel far more
+  than a 34 MB one. Worth confirming before anyone reads either nomic number as
+  its real cost; bucketing batches by length would be the fix if it holds.
 
 `OnnxEmbedder` is now compiled on every PR (the `onnx` job in `ci.yml`), which
 closes the gap where that code path got its first compile during a release.
@@ -188,11 +251,26 @@ closes the gap where that code path got its first compile during a release.
    load and should not be trusted. Per-*query* latency was never measured — one
    forward pass on a short query against a warm daemon, likely single-digit ms
    for both, and almost certainly not the thing to worry about.
-2. **A3/A4 need a chunker change** in `hoocode` — raise `CHUNK_MAX_CHARS`, bump
-   `CHUNKER_VERSION`, and fold in the blank-line fix parked at
-   `hybrid-retrieval-design.md:846` so users pay one rebuild rather than two.
-   Budget for it: indexing is already 3.5× slower on bge-small (~60 min vs ~17
-   for MiniLM, 20,430 chunks, 8 cores) and a bigger cap pushes that up.
+
+   **Resolved, 2026-09-05.** "~40k chunks" was the tell: the corpus is ~20k and
+   the harness was indexing it twice per arm, into a dense store and a hybrid
+   one, for identical vectors. That is fixed, so those totals were about double
+   the real indexing cost. Both halves are now recorded separately as
+   `timing.indexSeconds` and `timing.querySeconds`. The guess about query
+   latency was right and can stop being a guess: ~17s for 62 queries across all
+   16 configs, near-identical on every model, against 97s–354s of indexing.
+   Query cost is not where a model choice is decided.
+2. **A cap change needs a span-normalised metric first.** `--chunk-max-chars`
+   now makes the sweep runnable without touching `CHUNK_MAX_CHARS`, and the
+   sweep has been run. What it cannot currently settle is how much of cap
+   2000's win is retrieval and how much is line-overlap scoring rewarding
+   bigger spans; until a metric separates those, the arm describes rather than
+   decides. Shipping a cap change would still need `CHUNKER_VERSION` bumped and
+   a re-index for every user.
+
+   The blank-line fix this item said to "fold in" is **already landed**
+   (`chunker.ts:68-89`, `CHUNKER_VERSION` 2); the design note calling it parked
+   is stale. Nothing to carry.
 3. ~~**Drop `bge-small-prefixed`.**~~ Done, but softened on reflection: it is
    marked as measured-worse in `fetch-model.sh` and off the eval-build default
    list, **not deleted**. The risk was shipping it, not fetching it — and A2's

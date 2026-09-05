@@ -3,6 +3,16 @@ Cargo.lock
 embsearch-store/
 *.tmp
 
+# Model packs fetched by scripts/fetch-model.sh. Weights are tens to hundreds of
+# MB and are reproducible from the script, so they do not belong in git.
+#
+# pack/bge-small and pack/bge-small-prefixed were committed before this rule
+# existed (68 MB, the same 34 MB blob twice) and have been untracked with
+# `git rm --cached`. The blobs remain in history, so this caps the damage
+# rather than undoing it — .git stays ~40 MB. Purging them needs a history
+# rewrite, which would break every existing clone and has not been done.
+pack/
+
 # NOTE: crates/core/models/{model.onnx,tokenizer.json} are committed as EMPTY
 # placeholders so the `onnx` feature compiles. When you drop in the real
 # multi-megabyte weights locally, do NOT commit them — e.g.

@@ -512,10 +512,118 @@ caller reads a handful of results. **A1 is the winner of A1/A2** — ship
 
 A1/A2 each took **~60 min to index 20,430 chunks against A0's ~17 min** — 3.5×,
 on 8 cores. The note priced this change in download size (+10 MB) and said
-nothing about indexing time, because CLS pooling was not the cost; the 512-token
-window is. Every user pays it once per re-index, and A3/A4 raise the chunk cap,
-which pushes it further. This belongs in the shipping decision alongside the
-retrieval delta.
+nothing about indexing time. Every user pays it once per re-index, and A3/A4
+raise the chunk cap, which pushes it further. This belongs in the shipping
+decision alongside the retrieval delta.
+
+**Two corrections to those numbers, 2026-09-05.** Both came out of measuring
+rather than reasoning, and neither changes the shipping decision.
+
+First, *the totals were roughly double the indexing cost they appeared to be.*
+The harness built two complete indexes per arm — a dense-only store and a
+hybrid one — embedding the whole corpus twice to produce identical vectors. A
+hybrid store answers a dense query from the same vector index, verified
+bit-identical over 1,500 chunks, so the second pass bought nothing. It is gone;
+arms now index once.
+
+Second, *"CLS pooling was not the cost; the 512-token window is" was half
+wrong.* The window is real but it is not the whole gap, and the claim was never
+tested because there was no arm that changed the window without also changing
+the model. Adding one (`minilm-512`, MiniLM's own weights with the token limit
+raised 256 → 512) splits the 3.8× measured here cleanly in two:
+
+| step | what changes | chunks/s | factor |
+|---|---|---|---|
+| MiniLM @256 | — | 64.3 | 1.0× |
+| MiniLM @512 | window only, same weights | 35.0 | **1.8×** |
+| bge-small @512 | model only, same window | 16.9 | **2.1×** |
+
+So it is about half window and half model depth, and neither alone accounts for
+it. Measured on 22,012 chunks of the hoocode corpus, 8 cores, batch 48.
+
+The window costs anything at all only because chunks are larger than the note
+assumed: `chunker.ts` caps them at 1000 characters believing that to be "~256
+tokens", but code tokenizes at ~3.2 chars/token, so the median chunk is **313
+tokens**. MiniLM therefore truncates 85.8% of chunks and drops 20.3% of the
+corpus's tokens; bge-small at 512 drops 0.1%.
+
+### The confound that wasn't
+
+That truncation looked like it invalidated A1. If A0 indexed 80% of the corpus
+and A1 indexed all of it, then "model effect, isolated" was wrong — A1 changed
+the model *and* handed the dense leg a fifth more text, and the dropped fifth is
+always the tail of a chunk, which is exactly where the boundary and cross-file
+answers sit.
+
+`minilm-512` is the control that separates them, and **it refutes the
+confound**. Giving MiniLM the full chunk does not buy MiniLM bge-small's
+advantage; it buys almost nothing, and costs reach:
+
+| arm | MRR | R@10 | R@50 | sem MRR | sem R@10 |
+|---|---|---|---|---|---|
+| MiniLM @256 | 0.659 | 0.806 | 0.879 | 0.204 | 0.542 |
+| MiniLM @512 | 0.677 | 0.790 | 0.879 | 0.227 | **0.500** |
+| bge-small @512 | **0.718** | **0.855** | **0.960** | **0.334** | **0.667** |
+
+Against A0, `minilm-512` moves semantic MRR +0.023 where bge-small moves it
++0.131, and semantic R@10 goes *down* (−0.042, 0+/1−). Past its trained 256-token
+window MiniLM's extra context is not worth what it displaces. The 20% of tokens
+MiniLM never read were not costing it anything.
+
+So A1's headline survives intact, and is now better isolated than when it was
+first claimed: **bge-small's advantage is the model, not the coverage.** These
+numbers are from a 6,027-chunk screening subsample (see the runbook) and are
+inflated in absolute terms; the comparison between arms is the part that holds.
+
+### A3/A4: the premise was void, so the arm was re-specified
+
+A3/A4 were pre-registered as "the window the model unlocks" — raise the chunk
+cap to 2000/1500 and let bge-small's 512 tokens do something MiniLM's 256
+cannot. **That premise does not survive contact with the tokenizer.** Measured
+over the hoocode corpus:
+
+| cap | chunks | p50 tokens | chunks >512 | tokens dropped |
+|---|---|---|---|---|
+| 1000 (A0–A2) | 23,107 | 308 | 122 (0.5%) | 0.1% |
+| 1500 (A4) | 12,901 | 464 | 3,730 (28.9%) | 4.2% |
+| 2000 (A3) | 10,125 | 581 | 6,711 (**66.3%**) | **17.6%** |
+
+At the *current* cap only 0.5% of chunks exceed 512 tokens: the window is
+already fully exploited and there is no headroom to unlock. Raising the cap
+does not use the window, it overruns it — at 2000 bge-small truncates two
+thirds of chunks and drops 17.6% of tokens, which is the same pathology
+`minilm-512` was added to rule out. The largest cap that stays inside 512 is
+about 1100 chars, too small a change to measure.
+
+So the arms were re-specified, deliberately and on the record, from "what does
+the window unlock" to the descriptive question that is still live: **should the
+shipped cap go up, truncation and all?** Same corpus, same 344 files, bge-small
+throughout; only the cap moves.
+
+| cap | chunks | index | MRR | R@10 | R@50 | sem MRR | guard MRR |
+|---|---|---|---|---|---|---|---|
+| 1000 | 6,082 | 292s | 0.714 | 0.847 | 0.919 | 0.323 | 0.984 |
+| 1500 | 3,371 | 267s | 0.718 | 0.847 | 0.895 | 0.342 | 0.979 |
+| 2000 | 2,645 | **216s** | **0.741** | **0.895** | **0.935** | **0.413** | 0.969 |
+
+Two things nobody expected. Raising the cap makes indexing **cheaper**, not
+dearer — 26% faster at cap 2000 — because overlap is amortised over bigger
+chunks and total corpus tokens fall from 7.21M to 5.81M. The runbook budgeted
+for the opposite. And cap 2000 wins every retrieval metric despite truncating
+two thirds of its chunks.
+
+**Do not ship on this.** Nothing is significant (p ≥ 0.45, best split 9+/7−),
+the guardrail moves the wrong way for the first time in this series (0.984 →
+0.969, one query worse and none better), and there is a measurement artifact
+pushing the whole table in one direction: gold is scored by line overlap, and a
+bigger chunk spans more lines, so it overlaps a gold span more easily *without
+retrieving any better*. The same effect was seen inverted when halving
+`CHUNK_LINES` was tried and rejected for costing reach. Separating the artifact
+from the effect needs a span-normalised metric, which does not exist yet.
+
+What the arm does establish is narrower and still useful: a bigger cap is not
+the expensive option it was assumed to be, so the cost side of that decision
+can stop being a blocker.
 
 ---
 
