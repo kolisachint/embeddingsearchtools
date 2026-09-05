@@ -10,7 +10,7 @@ Three decoupled layers, so the engine plugs into different workflows:
 
 | Layer | What it does | Swap point |
 |-------|--------------|-----------|
-| **Embedder** (`Embedder` trait) | text → vector | `MockEmbedder` (default) or `MiniLmEmbedder` (`--features onnx`) |
+| **Embedder** (`Embedder` trait) | text → vector | `MockEmbedder` (default) or `OnnxEmbedder` (`--features onnx`) |
 | **Index** (`Index` trait) | top-k vector search | `FlatIndex` (exact) or `HnswIndex` (approximate), selected per store |
 | **Lexical** (`LexicalIndex`) | BM25 keyword search | optional, enables hybrid retrieval |
 | **Store** (`store` module) | atomic, mmap-friendly persistence | raw `f32` matrix + JSON manifest |

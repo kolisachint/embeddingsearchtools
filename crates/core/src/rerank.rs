@@ -94,7 +94,7 @@ mod onnx {
 
     /// `ms-marco-MiniLM-L-6-v2` relevance scoring via ONNX Runtime.
     ///
-    /// Mirrors [`MiniLmEmbedder`](crate::MiniLmEmbedder): weights bundled at
+    /// Mirrors [`OnnxEmbedder`](crate::OnnxEmbedder): weights bundled at
     /// compile time, `Session` behind a `Mutex` because ONNX Runtime's `run`
     /// takes `&mut self` while the trait needs `&self`.
     pub struct MiniLmCrossEncoder {

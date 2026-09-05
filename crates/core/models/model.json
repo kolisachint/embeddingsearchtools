@@ -1,0 +1,7 @@
+{
+  "name": "all-MiniLM-L6-v2-int8",
+  "dim": 384,
+  "pooling": "mean",
+  "normalize": true,
+  "max_tokens": 256
+}

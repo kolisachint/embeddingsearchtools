@@ -1,13 +1,23 @@
 #!/usr/bin/env bash
 #
-# Fetch the all-MiniLM-L6-v2 int8 ONNX weights + tokenizer and place them where
-# the `onnx` build bundles them from (crates/core/models/).
+# Fetch an embedding model (ONNX weights + tokenizer) and write the matching
+# `model.json` spec beside them.
+#
+# The spec is not optional decoration: `OnnxEmbedder` refuses a model directory
+# without one, because pooling, token limit and query/document prefixes cannot
+# be read off the weights and guessing them wrong is invisible in every output
+# except search quality.
 #
 # Run this on a machine with Hugging Face access, then build with `--features
 # onnx`. Portable across Linux/macOS/Windows-bash (needs curl).
 #
-#   scripts/fetch-model.sh
+#   scripts/fetch-model.sh                                  # bundled default
 #   cargo build --release --features onnx
+#
+# Fetch a different model, or one into a standalone directory for `--model`:
+#
+#   scripts/fetch-model.sh --model bge-small --dest ./models-bge
+#   embsearch serve --path ./store --model ./models-bge
 #
 # The cross-encoder reranker is a SEPARATE ~23 MB model and is NOT fetched by
 # default. Bundling it tripled the released binary (26 MB -> 73 MB extracted)
@@ -21,27 +31,103 @@
 set -euo pipefail
 
 WITH_RERANKER=0
-for arg in "$@"; do
-  case "$arg" in
+MODEL_ID="minilm"
+DEST=""
+
+usage() {
+  sed -n '2,30p' "$0"
+  cat <<'EOF'
+
+Options:
+  --model <minilm|bge-small>  Which embedding model to fetch (default: minilm)
+  --dest <dir>                Where to put it (default: crates/core/models)
+  --with-reranker             Also fetch the cross-encoder reranker
+EOF
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
     --with-reranker) WITH_RERANKER=1 ;;
-    -h|--help)
-      sed -n '2,25p' "$0"
-      exit 0
+    --model)
+      [ $# -ge 2 ] || { echo "--model needs a value" >&2; exit 2; }
+      MODEL_ID="$2"; shift
       ;;
-    *)
-      echo "unknown argument: $arg (expected --with-reranker)" >&2
-      exit 2
+    --model=*) MODEL_ID="${1#*=}" ;;
+    --dest)
+      [ $# -ge 2 ] || { echo "--dest needs a value" >&2; exit 2; }
+      DEST="$2"; shift
       ;;
+    --dest=*) DEST="${1#*=}" ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
+  shift
 done
 
 # Resolve the repo's models dir relative to this script.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MODELS_DIR="${SCRIPT_DIR}/../crates/core/models"
+MODELS_DIR="${DEST:-${SCRIPT_DIR}/../crates/core/models}"
 
-# Canonical int8 ONNX export of sentence-transformers/all-MiniLM-L6-v2.
-MODEL_URL="https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/main/onnx/model_quantized.onnx"
-TOKENIZER_URL="https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/main/tokenizer.json"
+# Per-model: weights URL, tokenizer URL, and the spec that describes how to run
+# them. `pooling` and `max_tokens` come from each model's own reference
+# pipeline (sentence-transformers config), not from a preference.
+case "$MODEL_ID" in
+  minilm)
+    # Canonical int8 ONNX export of sentence-transformers/all-MiniLM-L6-v2.
+    MODEL_URL="https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/main/onnx/model_quantized.onnx"
+    TOKENIZER_URL="https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/main/tokenizer.json"
+    read -r -d '' MODEL_SPEC <<'EOF' || true
+{
+  "name": "all-MiniLM-L6-v2-int8",
+  "dim": 384,
+  "pooling": "mean",
+  "normalize": true,
+  "max_tokens": 256
+}
+EOF
+    ;;
+  bge-small)
+    # BAAI/bge-small-en-v1.5. CLS pooling, 512 tokens — both differ from
+    # MiniLM, which is exactly why the spec travels with the weights.
+    #
+    # No query_prefix here. BGE's retrieval instruction ("Represent this
+    # sentence for searching relevant passages: ") is optional for v1.5 and is
+    # a separate eval arm, not a default: it belongs in a spec of its own so
+    # the two are distinguishable by model_id.
+    MODEL_URL="https://huggingface.co/Xenova/bge-small-en-v1.5/resolve/main/onnx/model_quantized.onnx"
+    TOKENIZER_URL="https://huggingface.co/Xenova/bge-small-en-v1.5/resolve/main/tokenizer.json"
+    read -r -d '' MODEL_SPEC <<'EOF' || true
+{
+  "name": "bge-small-en-v1.5-int8",
+  "dim": 384,
+  "pooling": "cls",
+  "normalize": true,
+  "max_tokens": 512
+}
+EOF
+    ;;
+  bge-small-prefixed)
+    # Same weights as bge-small, with the retrieval instruction on the query
+    # side only. A distinct `name`, so the two produce different model ids and
+    # a store built under one cannot be opened under the other.
+    MODEL_URL="https://huggingface.co/Xenova/bge-small-en-v1.5/resolve/main/onnx/model_quantized.onnx"
+    TOKENIZER_URL="https://huggingface.co/Xenova/bge-small-en-v1.5/resolve/main/tokenizer.json"
+    read -r -d '' MODEL_SPEC <<'EOF' || true
+{
+  "name": "bge-small-en-v1.5-int8-q",
+  "dim": 384,
+  "pooling": "cls",
+  "normalize": true,
+  "max_tokens": 512,
+  "query_prefix": "Represent this sentence for searching relevant passages: "
+}
+EOF
+    ;;
+  *)
+    echo "unknown --model '$MODEL_ID' (expected: minilm, bge-small, bge-small-prefixed)" >&2
+    exit 2
+    ;;
+esac
 
 # Cross-encoder used for reranking a shortlist. A separate model from the
 # embedder above and not interchangeable with it: this one scores a
@@ -52,11 +138,16 @@ RERANKER_TOKENIZER_URL="https://huggingface.co/Xenova/ms-marco-MiniLM-L-6-v2/res
 
 mkdir -p "$MODELS_DIR"
 
+echo "Fetching model '${MODEL_ID}' into ${MODELS_DIR}"
+
 echo "Downloading model.onnx ..."
 curl -fL --retry 3 -o "${MODELS_DIR}/model.onnx" "$MODEL_URL"
 
 echo "Downloading tokenizer.json ..."
 curl -fL --retry 3 -o "${MODELS_DIR}/tokenizer.json" "$TOKENIZER_URL"
+
+echo "Writing model.json ..."
+printf '%s\n' "$MODEL_SPEC" > "${MODELS_DIR}/model.json"
 
 if [ "$WITH_RERANKER" = "1" ]; then
   mkdir -p "$RERANKER_DIR"
@@ -84,6 +175,7 @@ echo
 echo "Fetched into ${MODELS_DIR}:"
 echo "  model.onnx               ${model_size} bytes"
 echo "  tokenizer.json           ${tok_size} bytes"
+echo "  model.json               $(wc -c < "${MODELS_DIR}/model.json") bytes"
 
 if [ "$WITH_RERANKER" = "1" ]; then
   rr_model_size=$(wc -c < "${RERANKER_DIR}/model.onnx")
@@ -104,9 +196,9 @@ fi
 echo
 # Record hashes so you can pin/verify them later if you want reproducibility.
 if command -v sha256sum >/dev/null 2>&1; then
-  sha256sum "${MODELS_DIR}/model.onnx" "${MODELS_DIR}/tokenizer.json"
+  sha256sum "${MODELS_DIR}/model.onnx" "${MODELS_DIR}/tokenizer.json" "${MODELS_DIR}/model.json"
 elif command -v shasum >/dev/null 2>&1; then
-  shasum -a 256 "${MODELS_DIR}/model.onnx" "${MODELS_DIR}/tokenizer.json"
+  shasum -a 256 "${MODELS_DIR}/model.onnx" "${MODELS_DIR}/tokenizer.json" "${MODELS_DIR}/model.json"
 fi
 echo
 echo "Done. Build the self-contained binary with:  cargo build --release --features onnx"
