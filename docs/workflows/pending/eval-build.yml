@@ -1,0 +1,114 @@
+name: Eval build
+
+# Builds an `onnx` binary plus one or more self-contained model directories and
+# attaches them to a **prerelease**, so a retrieval eval can compare models
+# without anyone rebuilding anything: one binary, `--model <dir>` per arm.
+#
+# Prerelease is load-bearing. Consumers resolve the binary through
+# `/releases/latest`, which GitHub excludes prereleases from, so nothing
+# published here can reach a user by accident.
+#
+# This is also the only place the `onnx` code path is *executed* — the smoke
+# step below indexes and queries with every model dir it builds. A model whose
+# pooling, dimensionality, tokenizer limit or ONNX input names are wrong fails
+# here rather than silently producing worse vectors downstream.
+
+on:
+  workflow_dispatch:
+    inputs:
+      models:
+        description: 'Comma-separated model ids from scripts/fetch-model.sh (minilm, bge-small, bge-small-prefixed)'
+        required: false
+        default: 'minilm,bge-small,bge-small-prefixed'
+      tag:
+        description: 'Prerelease tag to publish under (reused and clobbered across runs)'
+        required: false
+        default: 'eval-latest'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build eval binary + model packs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # The bundled model stays MiniLM, matching the real release build, so the
+      # eval binary differs from a shipped one only by carrying no version bump.
+      - name: Fetch bundled model weights
+        run: bash scripts/fetch-model.sh --model minilm
+
+      - name: Build (onnx)
+        run: cargo build --release -p embsearch-cli --features onnx
+
+      - name: Fetch model packs
+        run: |
+          set -euo pipefail
+          mkdir -p pack
+          IFS=',' read -ra MODELS <<< "${{ inputs.models }}"
+          for m in "${MODELS[@]}"; do
+            m="$(echo "$m" | tr -d '[:space:]')"
+            [ -n "$m" ] || continue
+            echo "::group::fetch $m"
+            bash scripts/fetch-model.sh --model "$m" --dest "pack/$m"
+            echo "::endgroup::"
+          done
+
+      # Prove each model dir actually embeds. A wrong pooling or a wrong token
+      # limit compiles and links perfectly and is invisible in any log, so the
+      # check has to be behavioural: the semantically matching document must
+      # win, and the two documents share no content words with the query.
+      - name: Smoke-test every model pack
+        run: |
+          set -euo pipefail
+          bin=./target/release/embsearch
+          cat > /tmp/smoke.jsonl <<'JSONL'
+          {"id":"animal","text":"a quick brown fox leaps over a sleeping hound in the meadow"}
+          {"id":"infra","text":"configure the database connection pool timeout and retry budget"}
+          JSONL
+          for dir in pack/*/; do
+            m="$(basename "$dir")"
+            echo "::group::smoke $m"
+            "$bin" index --path "/tmp/store-$m" --model "$dir" --input /tmp/smoke.jsonl
+            "$bin" query --path "/tmp/store-$m" --model "$dir" --json -k 2 "wolf chasing a rabbit" > "/tmp/hits-$m.json"
+            cat "/tmp/hits-$m.json"
+            top="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))[0]['id'])" "/tmp/hits-$m.json")"
+            if [ "$top" != "animal" ]; then
+              echo "::error::$m ranked '$top' above 'animal' for an animal query — the embeddings are wrong (pooling? truncation? dim?)"
+              exit 1
+            fi
+            echo "$m OK (top hit: $top)"
+            echo "::endgroup::"
+          done
+
+      - name: Package
+        id: package
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          tar czf dist/embsearch-eval-x86_64-unknown-linux-gnu.tar.gz -C target/release embsearch
+          for dir in pack/*/; do
+            m="$(basename "$dir")"
+            tar czf "dist/model-$m.tar.gz" -C pack "$m"
+          done
+          (cd dist && sha256sum ./*.tar.gz > SHA256SUMS && cat SHA256SUMS)
+          ls -la dist
+
+      - name: Publish prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag }}"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" \
+              --prerelease \
+              --title "$tag" \
+              --notes "Eval artifacts built from \`${GITHUB_SHA}\`. Not a release: prereleases are excluded from /releases/latest, so no consumer resolves them. One binary plus one directory per model — run an arm with \`embsearch serve --model <dir>\`."
+          fi
+          gh release upload "$tag" dist/* --clobber
+          gh release view "$tag" --json assets --jq '.assets[].name'
