@@ -4,6 +4,7 @@
 //! - `index`  — bulk-build a store from a JSONL file of `{"id","text"}`.
 //! - `add` / `update` / `remove` — single-record mutations.
 //! - `query`  — search a store and print hits.
+//! - `store-info` — report a store's manifest without loading a model.
 //! - `serve`  — run the long-lived NDJSON daemon (see `serve.rs`).
 //!
 //! The embedding backend is chosen at build time: the default build uses the
@@ -75,6 +76,22 @@ enum Command {
         /// RRF scores `--hybrid` returns.
         #[arg(long)]
         lexical: bool,
+        /// Emit JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Report what a store says about itself, without loading a model.
+    ///
+    /// `serve` and `query` pair a store with an embedder and refuse the pair
+    /// when their models disagree — so once a model changes, the store can no
+    /// longer be opened, and nothing will tell you which model built it. That
+    /// is precisely when a consumer needs to know, in order to decide between
+    /// rebuilding and pointing at the old model. This reads the manifest
+    /// directly and answers regardless.
+    StoreInfo {
+        /// Store directory to inspect.
+        #[arg(short, long, default_value = "./embsearch-store")]
+        path: PathBuf,
         /// Emit JSON instead of a table.
         #[arg(long)]
         json: bool,
@@ -202,6 +219,22 @@ fn run() -> embsearch_core::Result<()> {
                 for (rank, h) in hits.iter().enumerate() {
                     println!("{:>2}. {:<24} {:.4}", rank + 1, h.id, h.score);
                 }
+            }
+            Ok(())
+        }
+        Command::StoreInfo { path, json } => {
+            let info = embsearch_core::store::info(&path)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&info)?);
+            } else {
+                println!("path          {}", path.display());
+                println!("model_id      {}", info.model_id);
+                println!("dim           {}", info.dim);
+                println!("metric        {:?}", info.metric);
+                println!("index         {:?}", info.index);
+                println!("hybrid        {}", info.hybrid);
+                println!("rows          {} ({} live)", info.rows, info.live);
+                println!("format        v{}", info.format_version);
             }
             Ok(())
         }

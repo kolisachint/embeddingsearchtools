@@ -162,6 +162,49 @@ pub fn exists(dir: impl AsRef<Path>) -> bool {
     dir.as_ref().join(MANIFEST).is_file()
 }
 
+/// What a store says about itself, readable **without an embedder**.
+///
+/// [`load`] cannot answer this: a `Database` pairs a store with an embedder and
+/// refuses the pair when their models disagree, so by the time you could ask
+/// "which model built this?", you have already failed to open it. That is
+/// exactly the case a consumer needs the answer for — deciding whether to
+/// rebuild — so it has to be reachable from the manifest alone.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoreInfo {
+    pub format_version: u32,
+    pub model_id: String,
+    pub dim: usize,
+    pub metric: Metric,
+    pub index: IndexKind,
+    pub hybrid: bool,
+    /// Physical rows (live + tombstoned).
+    pub rows: usize,
+    /// Live (non-tombstoned) rows.
+    pub live: usize,
+}
+
+/// Read a store's manifest. Errors if `dir` holds no store or it is unreadable.
+///
+/// Deliberately does not validate `format_version`: reporting that a store is
+/// from an unsupported version is more useful than refusing to say anything
+/// about it, and the caller is usually deciding whether to discard it anyway.
+pub fn info(dir: impl AsRef<Path>) -> Result<StoreInfo> {
+    let dir = dir.as_ref();
+    let f = std::fs::File::open(dir.join(MANIFEST))?;
+    let manifest: Manifest = serde_json::from_reader(BufReader::new(f))
+        .map_err(|e| Error::corrupt(format!("invalid {MANIFEST}: {e}")))?;
+    Ok(StoreInfo {
+        format_version: manifest.format_version,
+        model_id: manifest.model_id,
+        dim: manifest.dim,
+        metric: manifest.metric,
+        index: manifest.index,
+        hybrid: manifest.hybrid,
+        rows: manifest.rows,
+        live: manifest.live,
+    })
+}
+
 fn read_f32_le(path: &Path) -> Result<Vec<f32>> {
     let f = std::fs::File::open(path)?;
     let mut reader = BufReader::new(f);
@@ -196,4 +239,51 @@ where
     }
     std::fs::rename(&tmp, path)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod info_tests {
+    use super::*;
+    use crate::index::{AnyIndex, IndexKind, Metric};
+
+    fn tmp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("embsearch-store-info-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// The property the whole migration path rests on: a store built by one
+    /// model can still be *identified* after the embedder has moved on, which
+    /// is when `Database::open` has stopped being able to answer.
+    #[test]
+    fn reports_model_id_for_a_store_no_current_embedder_could_open() {
+        let dir = tmp("foreign-model");
+        let mut index = AnyIndex::new(IndexKind::Flat, 3, Metric::Cosine);
+        index.add("a", vec![1.0, 0.0, 0.0]).unwrap();
+        save(&dir, &index, "some-retired-model-v0", false).unwrap();
+
+        let info = info(&dir).unwrap();
+        assert_eq!(info.model_id, "some-retired-model-v0");
+        assert_eq!(info.dim, 3);
+        assert_eq!(info.rows, 1);
+        assert_eq!(info.live, 1);
+        assert!(!info.hybrid);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reports_hybridness_so_a_caller_need_not_open_the_store_to_learn_it() {
+        let dir = tmp("hybrid");
+        let index = AnyIndex::new(IndexKind::Flat, 2, Metric::Cosine);
+        save(&dir, &index, "m", true).unwrap();
+        assert!(info(&dir).unwrap().hybrid);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn errors_when_there_is_no_store() {
+        let dir = tmp("absent");
+        assert!(info(&dir).is_err());
+    }
 }
