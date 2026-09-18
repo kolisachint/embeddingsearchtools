@@ -1,8 +1,28 @@
 # embeddingsearchtools
 
-A minimal, modular embedding search engine in Rust. It generates embeddings and
-serves low-latency similarity search behind a clean library API, a CLI, and a
-long-lived stdio daemon designed to be driven from a TypeScript `spawn`.
+Semantic search in Rust, built from the primitives rather than assembled out of
+services: **HNSW written from scratch**, **BM25 fused on top of the vectors**, and an
+**int8 MiniLM bundled inside the binary** through ONNX Runtime. No Python, no vector
+database, no network call — an mmap-backed store behind a library API, a CLI, and a
+long-lived stdio daemon.
+
+```bash
+embsearch index --path ./store --hybrid --input docs.jsonl
+embsearch query --path ./store --hybrid "how do vector databases work" -k 5
+```
+
+- **Exact by default; approximate only when you ask.** `flat` is 100% recall. `hnsw`
+  answers in `O(log n)` — **~94% recall@10 at ~2.5x** the exact scan on 10k 384-d
+  vectors, tunable to ~98%, and the speed gap widens with scale.
+- **Hybrid retrieval.** BM25 keyword scores fused with vector scores, for the queries
+  an embedding blurs. The keyword leg is addressable on its own.
+- **Small.** ~1.1 MB for the default binary; ~40 MB with the int8 model compiled in
+  through `include_bytes!`.
+- **Three ways in.** Rust library, CLI, or an NDJSON daemon that loads the model once
+  and answers a request per line — built to be driven from a TypeScript `spawn`.
+
+[Design](#design-at-a-glance) · [Performance](#performance) · [CLI](#cli) ·
+[Daemon protocol](#daemon-protocol-ndjson)
 
 ## Design at a glance
 
@@ -386,3 +406,16 @@ cargo build --release      # default binary
 cargo test                 # full suite against the mock backend
 cargo build --release      # default binary
 ```
+
+## Related
+
+A small set of offline-first tools for agents:
+
+- **[hoocode](https://github.com/kolisachint/hoocode)** — deterministic terminal
+  coding agent (TypeScript, on npm)
+- **[webtools](https://github.com/kolisachint/webtools)** — token-efficient web
+  fetch and search (Rust)
+- **[voicetools](https://github.com/kolisachint/voicetools)** — offline speech
+  recognition, mic to stdout (Rust)
+
+Built by [Sachin Koli](https://kolisachint.github.io).
